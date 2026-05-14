@@ -1,4 +1,4 @@
-# Messenger Multi Share / 拉线共享助手
+# Messenger Multi Share / 通话共享助手
 
 ## 中文说明
 
