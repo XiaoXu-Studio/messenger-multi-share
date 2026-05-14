@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "拉线共享助手",
-  "version": "2.6.10",
+  "version": "2.6.11",
   "description": "批量共享+批量开摄像头",
   "permissions": ["tabs", "activeTab", "scripting", "windows", "system.display"],
   "host_permissions": [
