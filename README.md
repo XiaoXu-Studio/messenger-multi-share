@@ -8,6 +8,7 @@
 
 - 自动检测正在进行的 Messenger / Facebook 群组通话标签页。
 - 将屏幕共享启动到已选择的多个通话窗口。
+- 通过悬浮按钮一键开启所有窗口的屏幕共享。
 - 一键停止多个通话窗口中的共享。
 - 停止共享后主动刷新 Messenger 通话布局，减少头像错位或画面残留。
 - 支持批量开启 / 关闭摄像头。
@@ -33,6 +34,7 @@ This is a Chrome/Edge browser extension for helping manage screen sharing across
 
 - Detects active Messenger/Facebook group call tabs.
 - Starts screen sharing across selected call windows.
+- Starts screen sharing across all windows with one floating button.
 - Stops sharing across active call windows.
 - Refreshes the Messenger call layout after sharing stops to reduce misplaced avatars or stale shared-video frames.
 - Includes batch camera controls.
@@ -47,4 +49,3 @@ This is a Chrome/Edge browser extension for helping manage screen sharing across
 ### Permissions
 
 This extension uses browser permissions to find call tabs, inject scripts into Messenger/Facebook call pages, control the extension UI, and temporarily adjust call window sizes during sharing.
-
