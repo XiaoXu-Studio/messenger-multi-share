@@ -15,6 +15,9 @@
   const sharingInfo = document.getElementById('sharingInfo');
   const btnCamOn = document.getElementById('btnCamOn');
   const btnCamOff = document.getElementById('btnCamOff');
+  const btnDiag = document.getElementById('btnDiag');
+  const btnExportLog = document.getElementById('btnExportLog');
+  const diagPanel = document.getElementById('diagPanel');
 
   let tabs = [];
   let sharing = false;
@@ -171,8 +174,108 @@
     btnCamOff.textContent = '全部关闭';
   });
 
+  // ---- 诊断与日志 ----
+  btnDiag.addEventListener('click', async () => {
+    btnDiag.disabled = true;
+    btnDiag.textContent = '诊断中...';
+    diagPanel.classList.add('active');
+    diagPanel.textContent = '正在读取当前通话状态...';
+    try {
+      const diagnostics = await chrome.runtime.sendMessage({ type: 'GET_DIAGNOSTICS' });
+      renderDiagnostics(diagnostics);
+    } catch (e) {
+      diagPanel.innerHTML = `<div class="diag-bad">诊断失败：${escapeHtml(e.message || String(e))}</div>`;
+    } finally {
+      btnDiag.disabled = false;
+      btnDiag.textContent = '一键诊断';
+    }
+  });
+
+  btnExportLog.addEventListener('click', async () => {
+    btnExportLog.disabled = true;
+    btnExportLog.textContent = '导出中...';
+    try {
+      const diagnostics = await chrome.runtime.sendMessage({ type: 'GET_DIAGNOSTICS' });
+      exportDiagnostics(diagnostics);
+    } finally {
+      btnExportLog.disabled = false;
+      btnExportLog.textContent = '导出日志';
+    }
+  });
+
   function cleanTitle(t) {
     if (!t) return '(通话)';
     return t.replace(/^\(\d+\)\s*/, '').replace(/^Messenger\s*[-–—]\s*/i, '').trim() || t;
+  }
+
+  function renderDiagnostics(data) {
+    const tabs = data?.tabs || [];
+    const injectedCount = tabs.filter((t) => t.injected).length;
+    const errorCount = tabs.filter((t) => t.error).length;
+    const consumedCount = tabs.filter((t) => t.consumed).length;
+    const rows = [
+      pair('插件版本', data?.version || '-'),
+      pair('共享状态', data?.sharing ? '共享中' : '未共享', data?.sharing ? 'diag-ok' : 'diag-muted'),
+      pair('检测通话', `${data?.callTabCount || 0} 个`),
+      pair('脚本响应', `${injectedCount}/${tabs.length}`),
+      pair('已消费共享流', `${consumedCount}/${tabs.length}`),
+      pair('异常窗口', `${errorCount} 个`, errorCount ? 'diag-bad' : 'diag-ok'),
+      pair('源窗口', data?.sourceTabId || '-'),
+      pair('上次开始', formatTime(data?.lastStartAt)),
+      pair('上次停止', formatTime(data?.lastStopAt)),
+    ];
+
+    const tabRows = tabs.map((tab) => {
+      const state = tab.error
+        ? `<span class="diag-bad">${escapeHtml(tab.error)}</span>`
+        : tab.consumed
+          ? '<span class="diag-ok">已共享</span>'
+          : tab.injected
+            ? '<span class="diag-ok">脚本正常</span>'
+            : '<span class="diag-warn">未响应</span>';
+      return `<div class="diag-line"><span>#${tab.tabId} ${escapeHtml(tab.role || '')}</span><span>${state}</span></div>`;
+    });
+
+    diagPanel.innerHTML = [
+      ...rows,
+      '<div class="diag-muted" style="margin-top:6px">窗口明细</div>',
+      ...(tabRows.length ? tabRows : ['<div class="diag-muted">暂无通话窗口</div>']),
+    ].join('');
+  }
+
+  function pair(label, value, cls = '') {
+    return `<div class="diag-line"><span class="diag-muted">${escapeHtml(label)}</span><span class="${cls}">${escapeHtml(value)}</span></div>`;
+  }
+
+  function exportDiagnostics(data) {
+    const text = JSON.stringify(data || {}, null, 2);
+    const blob = new Blob([text], { type: 'application/json;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    a.href = url;
+    a.download = `mms-diagnostics-${stamp}.json`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  function formatTime(value) {
+    if (!value) return '-';
+    try {
+      return new Date(value).toLocaleTimeString();
+    } catch {
+      return '-';
+    }
+  }
+
+  function escapeHtml(value) {
+    return String(value ?? '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#039;');
   }
 })();

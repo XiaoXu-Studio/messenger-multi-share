@@ -18,6 +18,11 @@ let selectedTabIds = null; // 弹窗勾选的标签页 ID 列表（用于浮动�
 // windowId -> { width, height, left, top, refCount }
 // refCount 记录有多少 tab 关联此窗口，直到最后一个 tab 恢复完才删除记录
 const savedWindowSizes = new Map();
+const LOG_LIMIT = 500;
+const eventLog = [];
+const tabDiagnostics = new Map();
+let lastStartAt = null;
+let lastStopAt = null;
 
 // ---- 消息处理 ----
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
@@ -26,6 +31,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   switch (msg.type) {
     case 'GET_STATE':
       sendResponse(getState());
+      return true;
+
+    case 'GET_DIAGNOSTICS':
+      collectDiagnostics().then((diagnostics) => sendResponse(diagnostics));
       return true;
 
     case 'START_SHARING':
@@ -72,16 +81,19 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
     case 'RECEIVER_READY':
       log(`receiver ready: tab ${fromTabId}`);
+      markTab(fromTabId, { streamReady: true, lastEvent: 'receiver-ready' });
       resolveReceiverEvent(receiverReadyWaiters, receiverReadyState, fromTabId, 'ready');
       break;
 
     case 'RECEIVER_SHARE_CONSUMED':
       log(`receiver consumed share: tab ${fromTabId}`);
+      markTab(fromTabId, { consumed: true, lastEvent: 'receiver-consumed' });
       resolveReceiverEvent(receiverConsumedWaiters, receiverConsumedState, fromTabId, 'consumed');
       break;
 
     case 'RECEIVER_SHARE_TIMEOUT':
       log(`receiver share timeout event: tab ${fromTabId}`);
+      markTab(fromTabId, { error: 'receiver share timeout', lastEvent: 'receiver-timeout' });
       rejectReceiverWaiter(receiverConsumedWaiters, fromTabId, 'receiver share timeout');
       break;
 
@@ -91,6 +103,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
     case 'CONNECTION_FAILED':
       log(`连接失败: tab ${msg.remoteTabId}`);
+      markTab(msg.remoteTabId, { error: 'connection failed', lastEvent: 'connection-failed' });
       break;
 
     // ---- 摄像头批量控制 ----
@@ -156,9 +169,19 @@ async function startSharing(tabIds) {
   if (!tabIds || tabIds.length < 1) return;
 
   sharing = true;
+  lastStartAt = new Date().toISOString();
   sourceTabId = tabIds[0];
   receiverTabs.clear();
   tabIds.slice(1).forEach((id) => receiverTabs.add(id));
+  tabIds.forEach((id) => markTab(id, {
+    role: id === sourceTabId ? 'source' : 'receiver',
+    injected: false,
+    shareButtonFound: null,
+    streamReady: false,
+    consumed: false,
+    error: null,
+    lastEvent: 'start-sharing',
+  }));
 
   log(`源: tab ${sourceTabId}, 接收端: [${[...receiverTabs].join(', ')}]`);
 
@@ -242,6 +265,11 @@ async function handleSourceReady() {
         // 点击共享按钮
         log(`click share request: tab ${receiverTabId}`);
         const result = await safeSend(receiverTabId, { type: 'CLICK_SHARE' });
+        markTab(receiverTabId, {
+          shareButtonFound: !!result?.found,
+          lastEvent: result?.found ? 'click-share-found' : 'click-share-not-found',
+          error: result?.found ? null : 'share button not found',
+        });
         if (result?.found) {
           log(`wait receiver consumed start: tab ${receiverTabId}`);
           await waitForReceiverConsumed(receiverTabId, 12000);
@@ -366,6 +394,7 @@ async function stopSharing() {
   }
   stopping = true;
   sharing = false;
+  lastStopAt = new Date().toISOString();
 
   const trackedTabs = [sourceTabId, ...receiverTabs].filter(Boolean);
   trackedTabs.forEach((tabId) => {
@@ -388,6 +417,7 @@ async function stopSharing() {
   const allTabs = [...new Set([...trackedTabs, ...allCallTabIds])];
   log(`stop sharing tabs detail: tracked=[${trackedTabs.join(', ')}], discovered=[${allCallTabIds.join(', ')}], all=[${allTabs.join(', ')}]`);
   log(`停止共享: ${allTabs.length} 个标签页 (跟踪=${trackedTabs.length}, 发现=${allCallTabIds.length})`);
+  allTabs.forEach((tabId) => markTab(tabId, { lastEvent: 'stop-sharing' }));
 
   // 并行发送 STOP_SHARING 给所有标签页
   await Promise.all(allTabs.map((tabId) => safeSend(tabId, { type: 'STOP_SHARING' })));
@@ -413,14 +443,19 @@ async function refreshCallTabs() {
 
 async function ensureScripts(tabId) {
   const pong = await safeSend(tabId, { type: 'PING' });
-  if (pong?.ok) return;
+  if (pong?.ok) {
+    markTab(tabId, { injected: true, lastEvent: 'script-ping-ok' });
+    return;
+  }
   log(`tab ${tabId} 需要注入脚本`);
   try {
     await chrome.scripting.executeScript({ target: { tabId }, files: ['inject.js'], world: 'MAIN' });
     await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] });
     log(`已注入脚本到 tab ${tabId}`);
+    markTab(tabId, { injected: true, lastEvent: 'script-injected', error: null });
   } catch (e) {
     log(`注入失败 tab ${tabId}:`, e.message);
+    markTab(tabId, { injected: false, lastEvent: 'script-inject-failed', error: e.message });
   }
   await sleep(500);
 }
@@ -469,6 +504,7 @@ async function safeSend(tabId, msg) {
     return await chrome.tabs.sendMessage(tabId, msg);
   } catch (e) {
     log(`发送消息到 tab ${tabId} 失败:`, e.message);
+    markTab(tabId, { error: e.message, lastEvent: `send-${msg?.type || 'message'}-failed` });
     return null;
   }
 }
@@ -619,5 +655,77 @@ async function toggleAllCameras(senderTabId, enable) {
 }
 
 function log(...args) {
+  const entry = {
+    time: new Date().toISOString(),
+    args: args.map(formatLogArg),
+  };
+  eventLog.push(entry);
+  if (eventLog.length > LOG_LIMIT) eventLog.shift();
   console.log('[MMS-bg]', ...args);
+}
+
+function markTab(tabId, patch) {
+  if (!tabId) return;
+  const prev = tabDiagnostics.get(tabId) || {};
+  tabDiagnostics.set(tabId, { ...prev, ...patch, tabId, updatedAt: new Date().toISOString() });
+}
+
+async function collectDiagnostics() {
+  const callTabs = await refreshCallTabs().catch(() => []);
+  const tabRows = [];
+  for (const tab of callTabs) {
+    const ping = await safeSend(tab.id, { type: 'PING' });
+    const prev = tabDiagnostics.get(tab.id) || {};
+    const injected = !!ping?.ok;
+    markTab(tab.id, {
+      title: tab.title,
+      injected,
+      inCall: true,
+      lastEvent: injected ? (prev.lastEvent || 'diagnostic-ping-ok') : 'diagnostic-ping-failed',
+    });
+    const next = tabDiagnostics.get(tab.id) || {};
+    tabRows.push({
+      tabId: tab.id,
+      title: tab.title || '(通话)',
+      role: next.role || (tab.id === sourceTabId ? 'source' : receiverTabs.has(tab.id) ? 'receiver' : 'idle'),
+      injected: next.injected === true,
+      shareButtonFound: next.shareButtonFound,
+      streamReady: next.streamReady === true,
+      consumed: next.consumed === true,
+      error: next.error || '',
+      lastEvent: next.lastEvent || '',
+      updatedAt: next.updatedAt || '',
+    });
+  }
+  return {
+    generatedAt: new Date().toISOString(),
+    version: chrome.runtime.getManifest().version,
+    sharing,
+    stopping,
+    sourceTabId,
+    receiverTabs: [...receiverTabs],
+    selectedTabIds,
+    lastStartAt,
+    lastStopAt,
+    callTabCount: callTabs.length,
+    selectedCount: selectedTabIds?.length || 0,
+    tabs: tabRows,
+    logs: eventLog.slice(),
+  };
+}
+
+function formatLogArg(arg) {
+  if (typeof arg === 'string') return sanitizeText(arg);
+  if (arg instanceof Error) return sanitizeText(arg.message);
+  try {
+    return sanitizeText(JSON.stringify(arg));
+  } catch {
+    return String(arg);
+  }
+}
+
+function sanitizeText(text) {
+  return String(text)
+    .replace(/https?:\/\/[^\s"'<>]+/gi, '[url]')
+    .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, '[email]');
 }

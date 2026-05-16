@@ -106,6 +106,29 @@
     .cam-section-head { font-size: 12px; color: #65676b; font-weight: 600; margin-bottom: 8px; }
     .cam-btns { display: flex; gap: 8px; }
     .cam-btns .big-btn { flex: 1; margin: 0; font-size: 13px; padding: 10px 8px; }
+
+    /* 诊断 */
+    .diag-section { padding: 8px 16px 14px; }
+    .diag-head { font-size: 12px; color: #65676b; font-weight: 600; margin-bottom: 8px; }
+    .diag-btns { display: flex; gap: 8px; }
+    .diag-btns button {
+      flex: 1; border: none; border-radius: 7px; padding: 9px 6px;
+      font-size: 12px; font-weight: 700; cursor: pointer;
+    }
+    .btn-diag { background: #eef4ff; color: #0066cc; }
+    .btn-log { background: #f0f2f5; color: #333; }
+    .diag-panel {
+      display: none; margin-top: 10px; padding: 9px;
+      border: 1px solid #e4e6eb; border-radius: 8px;
+      background: #f7f8fa; font-size: 11px; line-height: 1.5;
+      max-height: 180px; overflow-y: auto;
+    }
+    .diag-panel.active { display: block; }
+    .diag-line { display: flex; justify-content: space-between; gap: 8px; }
+    .diag-muted { color: #65676b; }
+    .diag-ok { color: #16833a; font-weight: 700; }
+    .diag-warn { color: #b26a00; font-weight: 700; }
+    .diag-bad { color: #c92828; font-weight: 700; }
   </style>
 </head>
 <body>
@@ -149,6 +172,17 @@
       <button class="big-btn btn-cam-on" id="btnCamOn">全部开启</button>
       <button class="big-btn btn-cam-off" id="btnCamOff">全部关闭</button>
     </div>
+  </div>
+
+  <!-- ===== 诊断与日志 ===== -->
+  <div class="divider"></div>
+  <div class="diag-section">
+    <div class="diag-head">🧪 诊断与日志</div>
+    <div class="diag-btns">
+      <button class="btn-diag" id="btnDiag">一键诊断</button>
+      <button class="btn-log" id="btnExportLog">导出日志</button>
+    </div>
+    <div class="diag-panel" id="diagPanel"></div>
   </div>
 
   <script src="popup.js"></script>
