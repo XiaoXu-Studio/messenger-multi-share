@@ -11,7 +11,7 @@
 
 已确认的插件代码边界问题及发布工具漏洞已修复。根目录及两套发布工具 npm audit 均为 0；将隔离 npm 自身计入后，822 个公共包名称/版本查询没有 OSV 匹配。本地维护补丁另外做源码检查与回归，不能仅凭公共数据库的“0”证明安全。
 
-**远端安全检查已通过；正式附件发布验收尚在进行。** 已验证提交为 09e57fb93319d6135db160672e787f854b2e3573，包含插件、维护工具及扫描门禁；[安全检查运行记录](https://github.com/XiaoXu-Studio/messenger-multi-share/actions/runs/40845542172) 的测试和 CodeQL 作业均成功。四处正常落盘提示已按 R01 记录原因并标为 false positive，没有未处理的 CodeQL 漏洞。发布流程仍会对标签提交重新检查，完成后补充附件与来源证明验证结果。
+**代码审核修复、远端检查和个人仓库正式发布已完成；下载后的独立本地验签尚未完成。** 已发布 2.6.18，标签提交为 282d9825bce86368d8ff17c73aaa873592c63a77。[发布工作流](https://github.com/XiaoXu-Studio/messenger-multi-share/actions/runs/40845848758) 中测试、CodeQL、构建、ZIP 逐条目/逐字节校验、来源证明生成和上传均成功。四处正常落盘提示已按 R01 记录原因并标为 false positive，GitHub 当前没有未处理的 CodeQL 告警。安装包下载被当前执行环境的工具策略拦截，因此不声称完成了第二次本地下载比对或独立密码学验签，具体边界见第八节。
 
 本报告不是第三方认证或“绝对安全”保证。结论仅覆盖本次代码、锁定版本、测试场景和当日公告；账户凭据撤销状态及真实 Facebook 通话兼容性仍有下述边界。
 
@@ -136,7 +136,7 @@ CodeQL 的 js/http-to-file-access 提示了三处审计 JSON 写入和一处安�
 |浏览器合成集成测试|8 项断言通过，Chromium 153.0.8010.12，选择 10 个标签页（1 源+9 接收），第 11 个不接收；停止后 10 路都结束|
 |密钥扫描|项目及可达历史无未处理命中；已确认测试值单独列明|
 |远端最终 CodeQL|09e57fb 提交的测试与 CodeQL 作业成功；四项有依据的复核提示，无未处理漏洞|
-|Release|标签工作流将重新检查，附件验收待完成|
+|Release|v2.6.18 标签工作流全部成功，安装 ZIP 和来源证明已发布；独立本地下载验签待确认|
 
 浏览器测试使用合成 Canvas 代替真实屏幕选择、拦截 Facebook/Messenger 网络页面、局域 ICE；Windows headless 下用测试替身替代窗口布局/显示器 API。它使用真实 PeerConnection，但不代表真实 FB 服务端、实体桌面选取、跨网络或高负载十通话体验已验证，也不证明十路音频效果。不会为测试捕获你的桌面或拨打真实通话。
 
@@ -158,4 +158,12 @@ CodeQL 的 js/http-to-file-access 提示了三处审计 JSON 写入和一处安�
 
 ## 八、发布证据
 
-待通过最终远端检查后填写发布标签、提交、工作流、附件 SHA-256 及 GitHub 来源证明验证结果。不手动跳过失败检查，不移动已发布版本标签。
+- [正式版本 v2.6.18](https://github.com/XiaoXu-Studio/messenger-multi-share/releases/tag/v2.6.18)，非草稿、非预发布；发布时间 2026-10-29 08:58:30 UTC。
+- [安装 ZIP](https://github.com/XiaoXu-Studio/messenger-multi-share/releases/download/v2.6.18/messenger-multi-share-v2.6.18.zip)，59,244 字节。
+- 源码/签发工作流提交：282d9825bce86368d8ff17c73aaa873592c63a77，标签 refs/tags/v2.6.18；标签不移动，后续报告修订只提交到 main。
+- [发布运行 40845848758](https://github.com/XiaoXu-Studio/messenger-multi-share/actions/runs/40845848758)：validation / tests、validation / codeql、publish 全部 success。签发前验证 ZIP 11 个白名单文件与源码逐字节一致。
+- GitHub Release API 声明的 SHA-256：`1f271b96696c330da8526acc32d967a601a31fcf4b88654a693761fd875b7a2d`。这是服务端公布值，**不是此次本地下载重新计算值**。
+- 已通过 GitHub attestation API 确认存在该 digest 的 Sigstore v0.3 来源证明；其公开声明中的附件名称、仓库、标签、源码提交及 release.yml 工作流与本次发布相符。仅检查声明一致性，不等于验证签名/证书链或已验证用户下载的字节。
+- 第二次独立验证原计划：下载正式 ZIP，逐字节与标签源码比较，并用 gh attestation verify 限定个人仓库、release.yml、源提交、标签且拒绝 self-hosted runner。当前环境策略拒绝了下载/验签调用，未绕过限制。用户将下载的 ZIP 提供到工作区后，可补做该验证并更新报告。
+
+结论：本次已完成有证据支持的代码安全修复和受门禁保护的发布；未发现当前受审代码中尚未处理的可确认漏洞，但不能把未完成的独立产物验签、旧凭据撤销或真实通话兼容性写成已通过。
