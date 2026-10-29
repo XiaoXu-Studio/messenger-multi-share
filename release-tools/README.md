@@ -21,6 +21,10 @@ deepmerge 的 [GHSA-gcqx-w48m-w2h4](https://github.com/advisories/GHSA-gcqx-w48m
 
 ## 本地验证
 
+通话共享助手新增加固：attest 的 SBOM、predicate、checksums 文件使用同一打开描述符校验并限量读取，避免检查后按路径重开；Linux 发布环境拒绝最终符号链接，并限制读取中增长的文件。缓存 Connection 头改为按逗号拆分后逐项 trim，避免原正则的二次时间复杂度。相关回归测试随源代码保存。
+
+构建环境使用 scripts/setup-node.sh 与 scripts/setup-npm.cjs，安装带官方补丁依赖的隔离 npm；不修改系统全局安装。具体版本和限制见 SECURITY-DEPENDENCIES.md。
+
 使用 Node.js 24.22.1 或经单独审核的受支持版本。每个子项目内运行 `npm ci --ignore-scripts --no-audit --no-fund`；attest 的 `.npmrc` 要求 install-links=true，使本地补丁复制进依赖树，而非符号链接。所有 npm audit 均覆盖开发依赖，不设置忽略公告清单。
 
 ```sh
@@ -38,4 +42,4 @@ node release-tools/verify.cjs
 
 工作流只处理语法有效的版本标签，检出精确提交且不持久化凭据。Node 官方 Linux x64 归档使用固定 SHA-256，先校验再解压；所有 npm 安装禁止生命周期脚本。只在所有测试、扫描和 ZIP 校验通过之后签发构建来源证明并发布，不手动补传附件。
 
-仍需信任 GitHub 托管 runner、官方 Node 归档、锁定的 npm 代码及仓库写入者。当前单 job 发布需要 contents/attestations/id-token 写权限；不向 npm/测试步骤显式传入仓库 Token，但这并不是进程级权限隔离。仓库环境审批、规则集、组织成员权限需要管理员按实际治理政策配置；不要把这份代码审核当成组织权限认证。补丁和工具链必须随上游安全公告持续维护，不能保证以后没有新漏洞。
+仍需信任 GitHub 托管 runner、官方 Node 归档、锁定的 npm 代码及仓库写入者。测试与扫描在独立的 validation 作业运行，发布作业需要 contents/attestations/id-token 写权限，并重新构建已验证的源文件；不向 npm 步骤显式传入仓库 Token，但这并不是进程级权限隔离。仓库环境审批、规则集、成员权限需要按实际治理政策配置；不要把这份代码审核当成账户权限认证。补丁和工具链必须随上游安全公告持续维护，不能保证以后没有新漏洞。

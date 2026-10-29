@@ -17,7 +17,6 @@ function check(document) {
   for (const run of document.runs) for (const result of run.results || []) {
     const reason = review(result);
     if (reason) {
-      result.suppressions = [{ kind: 'external', status: 'accepted', justification: reason }];
       accepted.push({rule: result.ruleId, locations: result.locations, reason});
     } else {
       // A suppression not present in our exact-source review must not bypass the gate.
@@ -30,7 +29,6 @@ if (require.main === module) {
   const file = process.argv[2], document = JSON.parse(fs.readFileSync(file, 'utf8'));
   const result = check(document);
   console.log(JSON.stringify(result, null, 2));
-  fs.writeFileSync(file, JSON.stringify(document));
   assert.equal(result.unresolved.length, 0, 'CodeQL found unresolved findings; publication is blocked');
 }
 module.exports = {check};

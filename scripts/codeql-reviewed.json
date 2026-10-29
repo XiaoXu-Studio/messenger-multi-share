@@ -13,5 +13,11 @@
     "sha256": "d21cc6f101c1921f9319043da4830d2217171bb86a0d6fb351a380f2aaad06c8",
     "sinks": ["fs.writeFileSync(path.join(repo, 'test-results/final-dependency-scan.json'), JSON.stringify(results, null, 2) + '\\n');"],
     "reason": "Reviewed informational: writes advisory API results as non-executable JSON to a constant test-results filename. HTTP values cannot choose the path and are never evaluated. The scan fails closed on advisory matches/errors. The JSON is excluded from extension packaging."
+  },
+  {
+    "file": "scripts/setup-npm.cjs",
+    "sha256": "da10b74186eed9b8b0a029e63133537c42d3334c10988660a200e7832b3f7cb0",
+    "sinks": ["fs.writeFileSync(archive, bytes, { flag: 'wx' });"],
+    "reason": "Reviewed verified installer: official HTTPS archive bytes are compared to fixed reviewed SHA-512 digests before this write or extraction. Archive names and versions come from a constant allowlist; output is inside a fresh private temporary directory, with exclusive creation. Redirects and package scripts are disabled. Arbitrary HTTP responses fail the hash check and are never written or executed. This is intentional verified dependency installation, not an arbitrary HTTP-to-file trust path."
   }
 ]

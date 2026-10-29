@@ -1,126 +1,160 @@
-# 通话共享助手安全审核记录（远端验收进行中）
+# 通话共享助手 2.6.18 安全审核报告
 
-最新进展：开发者已批准两项升级。维护的 attest/release 已安装、审计、重新构建并校验真实 bundle；根目录及两套发布工具 npm audit 均为 0，721 个 npm 包版本加 Pillow 13.0.0 共 722 项 OSV 查询无匹配。Pillow 隔离测试通过，现有图标未变。CodeQL 改为直接运行哈希固定的官方 CLI 2.27.3，移除旧 Action 的依赖树。以下为初始审查记录，最终验收报告将在远端扫描及发布验证完成后更新；原文“待开发者决定”现已得到批准。
+审核日期：2026-10-29。对象：通话共享助手（messenger-multi-share），不是另一个“浏览器拉线助手”插件。
 
-审核日期：2026-10-29。基线：组织仓库 `secure-artifacts/messenger-multi-share`，提交 `ffd7857ae74eb1ed5eef382688c54f3ae0dc708c`，版本 2.6.17。本地修订：2.6.18，尚未提交、推送或发布。
+- 原始基线：2.6.17，提交 `ffd7857ae74eb1ed5eef382688c54f3ae0dc708c`。
+- 个人仓库：[XiaoXu-Studio/messenger-multi-share](https://github.com/XiaoXu-Studio/messenger-multi-share)。
+- 组织仓库未修改。本地唯一推送目标及新发布流程均为个人仓库，以后在这里更新。
+- 开发者已批准发布/扫描工具链升级及维护、Pillow 升级且图标不变；已授权通过验证后发布新版本。
 
-## 结论和迁移状态
+## 一、结论与验收状态
 
-运行代码的已确认边界问题已修复，34 项单元/安全回归测试通过，隔离 Chromium 的十通话合成画面测试通过。但上游发布/扫描工具依赖仍有告警，升级方案和可选 Pillow 固定版本方案等待开发者决定，**不能判定整个项目已经通过最终安全审核**。
+已确认的插件代码边界问题及发布工具漏洞已修复。根目录及两套发布工具 npm audit 均为 0；将隔离 npm 自身计入后，822 个公共包名称/版本查询没有 OSV 匹配。本地维护补丁另外做源码检查与回归，不能仅凭公共数据库的“0”证明安全。
 
-已创建独立的个人仓库：[XiaoXu-Studio/messenger-multi-share](https://github.com/XiaoXu-Studio/messenger-multi-share)。本地唯一 remote 和默认推送目标已经切换到该个人仓库；组织仓库未修改。个人仓库尚为空，待工具链复核后再推送、打标签和发布，避免把尚待处理的流程作为正式版本分发。
+**远端最终扫描与发布验收：进行中，尚不能据此认定新版本已经发布。** 下文记录已完成的工作；发布成功后会补充最终工作流、附件与来源证明验证结果。
 
-## 一、概况与范围
+本报告不是第三方认证或“绝对安全”保证。结论仅覆盖本次代码、锁定版本、测试场景和当日公告；账户凭据撤销状态及真实 Facebook 通话兼容性仍有下述边界。
 
-- 原生 JavaScript / HTML / CSS，Chrome Manifest V3；后台 Service Worker、ISOLATED 内容脚本和 MAIN 媒体适配脚本。
-- 浏览器安装包：11 个白名单文件，运行时第三方 npm 依赖 **0**。新增 Node 内建测试和构建脚本，根目录 npm 直接/间接依赖均为 **0**，package-lock v3。
-- 原始项目 16 个受控文件全部审阅；同时审阅新增校验、构建、测试脚本和 CI 配置。原始 10 次提交、34 个去重历史 blob 纳入密钥扫描。
-- 可选图标工具：`gen_icons.py` 直接依赖 Pillow，原来没有版本或锁文件；`generate-icons.html` 使用原生 Canvas。二者都不参与发布安装包。
-- CI 直接引用 4 个上游 Action 仓库（CodeQL 的 init/analyze 算同一依赖）。另有系统 Node、Git、zip/unzip、GitHub runner 信任边界。单独安装的 Playwright 仅用于本次测试，不加入项目或安装包。
-- 没有服务器、数据库、登录后端、移动端或 Electron 组件；SQL/NoSQL 注入、后端 CSRF/SSRF、桌面 IPC、WebView、数据库连接串等不适用于本项目，不能把“不适用”写成已验证安全。
+## 二、项目概况及审核范围
 
-## 二、问题汇总
+- 原生 JavaScript、HTML、CSS；Chrome Manifest V3。后台 Service Worker、ISOLATED 内容脚本、MAIN 媒体适配脚本，以及扩展自己的弹出界面。
+- 安装 ZIP 只含 11 个白名单文件。插件运行时第三方依赖为 **0**；根目录 npm 外部依赖也为 **0**，构建/测试使用 Node 内建模块。
+- 两个独立发布工具共有 41 条直接依赖声明（含开发依赖、重复名称），完整实际版本见 [依赖清单](SECURITY-DEPENDENCIES.md)。attest 锁文件含 619 个非根位置、release 为 182；平台可选依赖不一定在 Windows 实装。
+- 可选图标生成工具固定 Pillow 13.0.0，不进入安装包。使用独立环境测试，现有三个 PNG 与原始提交相比均未改变。
+- Node 24.22.1、CodeQL CLI 2.27.3 分别核验官方归档 SHA-256。隔离 npm 12.2.1 的官方归档及两个官方补丁包核验 SHA-512。
+- 范围包括原始全部 16 个受控文件、修改/新增的运行代码、配置、测试、构建及发布脚本，以及锁文件、实际构建输入、生成 bundle、Git 可达历史。未将其他项目的文件当作本插件修复。
+- 无服务端、数据库、Electron、移动应用组件；SQL/NoSQL 注入、后端 CSRF/CORS/SSRF、移动 WebView/桌面 IPC 等无相应实现。不适用不代表这些类别都经过了可利用性测试。
 
-行号为本地修订文件的定位点；风险描述基于修复前行为。依赖严重程度沿用数据库，不能直接等同于插件实际可利用程度。
+## 三、问题汇总
+
+位置指向修复后的入口；依赖公告等级与项目实际利用条件分开描述。
 
 |编号|类别|严重级别|位置|状态|
 |---|---|---|---|---|
-|C01|代码|High|background.js:34、background.js:453、content.js:24|已修复：跨标签页消息、角色、会话和目标授权|
-|C02|代码|High|background.js:178|已修复：显式勾选为空/失效时误退回所有通话|
-|C03|代码|Medium|inject.js:21、inject.js:38、content.js:102|已修复：取消后的迟到捕获、等待和克隆流清理|
-|C04|代码|Medium|background.js:197、background.js:95、background.js:275|已修复：并发启动、重复 SOURCE_READY、过期异步操作|
-|C05|代码|Low|manifest.json:6|已修复：删除不需要的 tabs、activeTab、windows 权限|
-|C06|代码|Low|background.js:740、background.js:757、security.js:29|已修复：诊断标题/URL/邮箱/常见 Token 泄露及无界日志|
-|C07|代码|Medium|.github/workflows/release.yml:31|已修复：标签直接拼接 shell、可变 Action 引用及凭据持久化|
-|C08|代码|Low|scripts/build.cjs、scripts/package-safety.cjs、scripts/verify-zip.cjs|已修复：打包文件范围和链接目标缺少校验|
-|C09|代码|Low|content.js:494、content.js:527、popup.js:134|已修复：脚本合成浮动按钮点击和失败却显示共享成功|
-|D01|依赖|Critical|旧 attest Action 的 tar 7.4.3 及其他锁定依赖|待开发者决定：升级/维护工具链；实际利用路径尚待确认|
-|D02|依赖|High|checkout、release、CodeQL 的上游锁文件|待开发者决定：更新并验证实际运行 bundle，不仅修改版本标签|
-|D03|依赖|Low|gen_icons.py:2|待开发者决定：Pillow 未锁定；实际环境版本未知，不据此宣称存在可利用 Critical|
-|K01|密钥|High|历史聊天中曾粘贴 GitHub 凭据（不在本次代码命中中）|建议关注：到 GitHub 确认旧凭据已撤销；状态待确认|
+|C01|代码|High|background.js:34、background.js:453；content.js:24|已修复：消息来源、角色、会话及跨标签页目标授权|
+|C02|代码|High|background.js:178|已修复：显式空选/失效选择不得扩大为所有通话|
+|C03|代码|Medium|inject.js:21；content.js:102|已修复：迟到捕获、取消等待、媒体轨道与克隆清理|
+|C04|代码|Medium|background.js:197、background.js:275|已修复：并发开始、重复 READY、过期异步回调|
+|C05|代码|Low|manifest.json:6|已修复：移除不必要的 tabs/activeTab/windows 声明|
+|C06|代码|Low|background.js:740；security.js:29|已修复：诊断标题、常见敏感值及无界日志|
+|C07|代码|Medium|.github/workflows/release.yml:1；scripts/setup-node.sh:1|已修复：可变工具、标签 shell 输入、凭据持久化和发布前检查不足|
+|C08|代码|Low|scripts/package-safety.cjs:1；scripts/build.cjs:1；scripts/verify-zip.cjs:1|已修复：打包白名单、链接/硬链接、路径与版本校验|
+|C09|代码|Low|content.js:494、content.js:527；popup.js:134|已修复：合成按钮点击及启动失败却显示成功|
+|C10|代码|Medium|release-tools/attest/src/read-bounded.ts:7；sbom.ts:13；predicate.ts:36；subject.ts:202|已修复：检查文件后按路径重新打开的竞态及读取增长越界|
+|D01|依赖|Critical|旧 attest/checkout/release Action 锁文件；现 release-tools/|已修复：弃用旧运行 bundle、升级/维护依赖并重新构建验证|
+|D02|依赖|High|旧 CodeQL Action；现 scripts/codeql-scan.sh:1|已修复：改用固定官方 CLI 和查询包，不再运行旧 Action 依赖树|
+|D03|依赖|Low|requirements-icons.txt:1；gen_icons.py:1|已修复：可选 Pillow 未固定；不能据此断言原环境存在可利用 Critical|
+|D04|依赖|High|scripts/setup-npm.cjs:7|已修复：npm 自带 undici / ip-address 旧版本|
+|D05|代码|High|release-tools/http-cache-semantics/index.js:540|已修复：Connection 头空白匹配的二次时间复杂度|
+|R01|代码|Low|scripts/codeql-reviewed.json:1|建议关注：四处已人工确认的正常 HTTP 数据落盘提示，非已确认漏洞|
+|K01|密钥|High|以前聊天中公开过的 GitHub 凭据，不在本次代码命中中|建议关注：旧凭据是否已撤销待确认；不在报告复写凭据|
 
-### C01：消息与共享目标授权
+### C01—C04：共享授权及生命周期
 
-原来网页消息缺少角色/会话校验，后台转发信令没有核对用户选中的接收目标。若允许站点内有恶意或被攻陷脚本，并且用户已经开始捕获，存在跨通话错误路由、干扰或扩大共享对象的风险。是否能完整窃取媒体取决于攻击者完成 SDP/ICE 协商等条件；本次没有把负向测试当成旧版本媒体外泄实证。
+利用条件：被允许网站内存在恶意/被攻陷脚本，用户已开始共享，且攻击者能够构造消息或触发异步竞态。旧代码未充分约束角色与目标，有错路由、干扰共享或扩大对象的风险；并未声称已在旧版本复现完整媒体窃取。
 
-修复：验证浏览器提供的扩展 ID、发送者 URL、顶层 frame；面板命令仅接受扩展自己的 popup；事件绑定当前随机会话及源/接收角色；只允许“源 ↔ 已选择接收端”，禁止接收端互连或指定其他标签页。再次发送前检查目标仍在允许的通话页面，显式投递到 frame 0。限制 tab 数、SDP/ICE 大小、候选缓存和每对端信令数量，投影允许的字段。
+修复包括：
 
-MAIN world 和同页 postMessage **不是身份认证机制**，随机会话值用于隔离旧会话，并不对同页脚本保密；必须同时依赖 ISOLATED/background 中的目标集合校验。已被授权拿到屏幕的网页仍需信任。
+1. 后台验证浏览器提供的扩展 ID、顶层 frame、严格 HTTPS 主机/通话路径；控制命令仅接受扩展自己的 popup URL。
+2. 随机会话隔离新旧请求；信令只允许“源 ↔ 用户已选择接收端”，不允许接收端互连或添加未选择标签页。投递前再次检查页面和当前会话。
+3. 显式空选或选择失效时拒绝启动；不偷偷改成全部通话。限制标签数、SDP/ICE 字段和长度、缓存及每对端信令次数。
+4. 停止时清理扩展持有的原始捕获、接收流、交付克隆、PeerConnection、ICE 和等待器；迟到的原生捕获立即停止。取消等待不会意外弹出新的原生选择框。
+5. await 前占用会话，之后复核代次；READY 去重，旧回调不能结束新共享。必要的原生用户屏幕选择仍保留。
 
-### C02—C04：尊重选择与生命周期
+MAIN world / postMessage 不是身份认证通道，同页脚本可以观察或伪造其中的数据；真正的跨标签页授权必须在 ISOLATED/background 执行。网页既然获准接收媒体，就不能由本插件保证它删除已复制的数据或自己的媒体克隆。
 
-- 用户取消勾选或标签页失效后，原浮动按钮会退回所有通话，可能把画面发到非预期通话。现在拒绝启动并提示重新选择，不扩大范围。
-- 原生选择框尚未返回时停止共享：返回的迟到流立即停止并以 AbortError 结束；接收端等待取消后不得继续打开原生选择框。
-- STOP 同时清理原始捕获流、接收流、扩展交付的克隆、PeerConnection 和 ICE 缓存。无法承诺销毁恶意网页自行复制的数据或第三方另建的媒体流。
-- 启动前立即占用会话，防止第二个面板抢占；关键 await 后重新确认会话；SOURCE_READY 去重；旧会话异常不得停止新会话；停止/关闭标签页时释放等待器；延迟停止按钮操作以代次号隔离。
+### C05—C09：最小权限、显示及构建
 
-### C05—C09：最小权限、诊断与构建
+保留 scripting/system.display；host_permissions 限定两个 www HTTPS 网站。网站全路径访问用于 SPA 页面导航，不扩成所有网站。没有 remotely hosted code、外部扩展消息入口或远程 eval。匹配网站的 host 权限可提供相应标签页信息，因此移除不必要 tabs 权限后另做浏览器发现测试。[Chrome 官方权限说明](https://developer.chrome.com/docs/extensions/develop/concepts/declare-permissions)
 
-- 两个站点的 host_permissions 已足以读取匹配标签页的 URL/title，不需要广泛的 tabs 权限；activeTab 没有实际用途，windows 不是此处需要的权限。保留 scripting/system.display，并用真实浏览器验证标签页发现仍正常。[Chrome 权限文档](https://developer.chrome.com/docs/extensions/develop/concepts/declare-permissions)
-- 对日志先脱敏再输出到控制台；移除导出诊断中的通话标题，限制 500 条事件、128 个诊断对象、单项 2048 字符。脱敏是尽力保护，不承诺识别所有任意格式的个人信息。
-- 标签经环境变量传入 shell 并限制为严格语义版本格式，所有第三方 Action 固定完整提交，不持久化 checkout 凭据。仅个人仓库能触发发布 job。**固定 SHA 不会修复该提交自身的依赖漏洞**；因此仍未发布。
-- 新增白名单构建、版本/标签一致性检查、源文件大小/语法/疑似凭据检查、源/目标链接与硬链接检查、ZIP 完整条目及逐字节校验。
-- 浮动按钮要求可信用户点击；诊断 HTML 的 tabId 也转义；共享启动失败时面板显示错误而不是成功。此处不是完整的网页防点击劫持方案。
-- 图标 Python 工具去掉硬编码 D 盘路径，改为项目 icons，并增加 main guard 和文件关闭，不会在 import 时改图标；本轮未运行生成器、未修改 PNG。
+日志先脱敏再写入控制台；删除导出的通话标题；上限 500 条事件、128 个诊断对象、单文本 2048 字符。常见 URL、邮箱、Token 有替换规则，但不承诺识别所有形式的个人信息。
 
-## 三、依赖核对与扫描
+浮动按钮只响应可信用户事件；诊断插入 HTML 的字段转义；后台拒绝启动时面板显示错误。未将这一措施宣传成完整防点击劫持系统。
 
-### 项目全部直接依赖
+发布流程检出精确提交，不保存 Git 凭据；标签通过环境变量传入且严格验证版本语法；只允许个人仓库发布。测试/扫描先在独立 validation 作业通过，再允许发布。所有 npm 安装禁止生命周期脚本，实际构建输入及 bundle 依赖另行验证。
 
-|依赖|实际基准/状态|作用|
-|---|---|---|
-|插件运行和根目录 npm|0 个第三方依赖；Node 24.22.1|构建和测试只使用内建模块|
-|Pillow|原始未固定，实际安装版本待确认；PyPI 查询最新 13.0.0|可选图标生成，不进入 ZIP|
-|actions/checkout|v4.3.0；11d5960a326750d5838078e36cf38b85af677262|CI 检出|
-|actions/attest-build-provenance|v2 指向 e8998f949152b193b063cb0ec769d69d929409be；其中 package.json 自报 1.1.5，不能据此冒充 Action 标签版本|构建来源证明|
-|softprops/action-gh-release|v2.6.2；3bb12739c298aeb8a4eeaf626c5b8d85266b0e65|Release 附件发布|
-|github/codeql-action|v4.39.1；9b3254085494b55a0f7c4c2b3d2d52cc712ce370|JavaScript 语义扫描|
+打包前校验源/输出链接、硬链接和文件范围；验证 manifest/package/tag 一致；安装 ZIP 逐条目及逐字节对照白名单，拒绝多余、重复和路径穿越条目。构建/测试工具不会进入插件 ZIP。
 
-逐一查询了各 Action 官方安全页、Pillow 官方公告，并从固定提交下载 package.json/package-lock.json。对每份锁文件运行 npm audit（包含开发依赖，不执行其代码）。结果为包级告警计数，不是唯一 CVE 数，也不能将不同树简单相加：
+### C10 / D05：远端 CodeQL 检出的工具问题
 
-|扫描对象|锁文件 package 节点数（非根）|Critical|High|Moderate|Low|
+- CodeQL 把三处文件系统竞态标为 High。本项目实际需要攻击者具有 runner 本地文件修改能力，并且使用 SBOM/predicate/checksums 输入（当前发布走 subject-path）；结合可达性评为 Medium。修复不是删除检查，而是先打开，再用同一文件描述符 stat/限量读取，finally 关闭；Linux 拒绝最终符号链接和非普通文件。新增测试覆盖文件读中增长、目录/超限输入、描述符使用及 Linux 符号链接。
+- 缓存 Connection 头原正则可能对长空白输入反复回溯，CodeQL 标为 High；触发需要恶意或被篡改的上游 HTTP 头，影响发布工具可用性，不是插件运行时。改为 split(',') 后逐项 trim，并测试 20 万空白字符及正常头删除行为。
+- 文件描述符修复不能代替 runner 隔离；具备同一进程权限的恶意程序仍可能修改已打开文件内容，来源证明不对受攻陷构建机提供绝对保证。
+
+### R01：明确记录扫描误报/信息提示
+
+CodeQL 的 js/http-to-file-access 提示了三处审计 JSON 写入和一处安装器归档写入。审计写入目的地来自固定文件名/操作员证据目录，不由 HTTP 内容决定；数据不执行、不进入安装包。安装器只接受常量版本的 HTTPS 地址、禁止重定向，先核验固定 SHA-512 才落盘/解压，使用全新目录和排他创建。
+
+这些提示保留原始 SARIF，不篡改扫描器结果。发布检查仅接受人工审阅清单中的“规则、文件、完整源码 SHA-256、具体写入语句”均匹配的提示；任何源码变化或新位置都需重新审阅，否则阻止发布。回归测试验证未知告警/伪造 suppression 不能绕过。此项属于有依据的复核，不计作四个已修复漏洞。
+
+## 四、依赖公告、实际版本与维护情况
+
+全部直接依赖和关键实际间接版本见 [SECURITY-DEPENDENCIES.md](SECURITY-DEPENDENCIES.md)，两个 package-lock.json 提供完整树；不能用 package.json 的版本范围冒充实际安装版本。
+
+基线扫描包含开发依赖，未运行旧包脚本。下面是包级数量，不是唯一 CVE 数，也不能把树相加当作漏洞总数：
+
+|旧工具|锁文件节点|Critical|High|Moderate|Low|
 |---|---:|---:|---:|---:|---:|
-|项目根目录|0|0|0|0|0|
 |checkout|551|0|8|6|8|
 |attest-build-provenance|678|1|14|10|12|
 |action-gh-release|185|0|6|3|2|
 |codeql-action|778|0|2|0|0|
 
-本地完整库存和原始审计 JSON 位于工作区 `work/callshare-audit-2026-10-29/`；包含全部上游 directDependencies、devDependencies 和锁文件实际节点，不把 manifest 版本范围误当实际版本。此目录是证据，不进入扩展 ZIP。`scripts/audit-upstream.cjs` 可按固定提交复查。
+处理和证据：
 
-关键间接依赖实际版本：checkout 的 undici 5.29.0、brace-expansion 1.1.12/2.0.2、deepmerge 4.3.1；attest 的 tar 7.4.3、@sigstore/core 2.0.0、undici 5.29.0、http-cache-semantics 4.1.1、deepmerge 4.3.1；release 的 undici 6.24.1、brace-expansion 5.0.5、vite 8.0.5、vitest 4.1.0；CodeQL 的 node-forge 1.4.0、undici 6.28.0。
+- checkout 改为无凭据的受限 Git 检出；旧 CodeQL Action 改为固定 CLI 2.27.3。旧 node-forge 验证缺陷无需靠猜测新版是否修复，旧 Action 包不再运行。CLI 本身是独立二进制信任边界，npm 扫描不覆盖它的所有原生组件。[CodeQL CLI 官方说明](https://docs.github.com/en/code-security/concepts/code-scanning/codeql/codeql-cli)
+- attest 基于 actions/attest v4.2.2，release 基于 softprops/action-gh-release v3.0.3；保留来源提交、许可证、测试，维护修复后的锁文件，现场重建 bundle。旧 tar 7.4.3 告警的归档解析要求不可信归档进入工具，不是插件业务；不能把它直接说成插件 Critical。旧树已退出执行路径。[tar 公告](https://github.com/advisories/GHSA-23hp-3jrh-7fpw)
+- undici 运行依赖固定 6.29.1，测试依赖 8.12.2；修复 TLS/内容编码等相关公告。npm 12.2.1 自带 6.29.0，另在隔离安装中替换成官方 6.29.1，而非假称 npm 最新版自身无告警。[TLS 公告](https://github.com/advisories/GHSA-2m5v-pch6-74hx)、[内容编码公告](https://github.com/advisories/GHSA-xjj6-f33q-929c)、[npm 上游问题](https://github.com/npm/cli/issues/10163)
+- npm 自带 ip-address 10.7.2 换为 10.7.4，工具锁文件亦为 10.7.4；长 IPv6 zone 标识可造成二次时间处理，是工具端网络输入风险。[公告](https://github.com/advisories/GHSA-rxp7-6hxx-x8q5)
+- @sigstore/oci 0.7.2、@sigstore/core 3.2.1、csv-parse 7.0.3、brace-expansion 5.0.12、glob 13.0.6、re2js 2.9.1 等实际版本已对锁文件、安装树、bundle 输入交叉验证。[OCI 官方安全页](https://github.com/sigstore/sigstore-js/security/advisories)、[CSV 公告](https://github.com/adaltas/node-csv/security/advisories/GHSA-8cw4-87c7-c6xx)、[re2js 公告](https://github.com/advisories/GHSA-gg6h-894w-4m9c)
+- deepmerge 官方公告未给出修复版，按已批准的维护方案保留明确命名的本地补丁 4.3.1-patch.1，对源/目标及 null-prototype 对象过滤危险键并回归。公共数据库不识别这一补丁，必须人工审阅并测试。[公告](https://github.com/advisories/GHSA-gcqx-w48m-w2h4)
+- 缓存库的 GHSA-ch52-4w7c-c8xp 已被撤回为无效漏洞，不再记作未解决 High；保留已测的防御性缓存补丁，并追加本次正则修复。没有虚构上游认可的安全版本。[撤回记录](https://github.com/advisories/GHSA-ch52-4w7c-c8xp)
+- Pillow 13.0.0 是官方 FPX 缺陷修复版。攻击需恶意 FPX 进入相应解码路径；本工具只绘图/读取自己生成的 PNG，因此不能将官方 Critical 等级直接套在插件上。按授权固定版本、隔离测试且不重绘现有图标。[Pillow 官方公告](https://github.com/python-pillow/Pillow/security/advisories/GHSA-5x8w-8jj5-q52h)
 
-重点判断：
+旧工具中的弃用依赖（如 uuid 3、旧 ESLint 8、rimraf 3 等）随旧树退出；当前两份锁文件没有 deprecated 标记。nock 13 为上游测试兼容保留，应继续关注维护状态；久未更新不自动等于漏洞。未发现直接依赖名有明显仿冒特征，但这不构成对每位发布者身份的认证。
 
-- tar 的 [GHSA-23hp-3jrh-7fpw](https://github.com/advisories/GHSA-23hp-3jrh-7fpw) 标记 Critical，单条公告修复点 7.5.19；同一树还有其他较新的 tar 公告，不能只升级到这一最低版本。利用需要处理恶意归档，本扩展不使用 tar；Action 实际 bundle 和输入路径是否可达还需核对。
-- undici 的 TLS 配置丢失和异常内容编码等公告对应修复分支 6.29.1 / 7.30.1 / 8.12.2。网络处理发生在 CI 而非插件；本项目未配置自定义 TLS Agent，也没有 WebSocket/EventSource 客户端业务，不能把所有公告都算成可直接利用。普通 HTTP 请求的相关路径仍需结合实际 bundle 复核。[TLS 公告](https://github.com/advisories/GHSA-2m5v-pch6-74hx)、[内容编码公告](https://github.com/advisories/GHSA-xjj6-f33q-929c)
-- node-forge 1.4.0 命中 [GHSA-86w9-cpqp-85rv](https://github.com/advisories/GHSA-86w9-cpqp-85rv)。检索并阅读 CodeQL 的 `src/start-proxy/ca.ts`，该处生成/签署 CA，没有调用公告中的不可信 RSA 签名验证；本项目仅使用 JS init/analyze，未配置该代理。公告页面当前未列修复版本，但 registry 已有 1.4.2；**其修复映射及完整 bundle 可达性待确认**，不能仅凭 npm fixAvailable=true 宣称已解决。
-- [CodeQL 旧 PAT 泄露公告](https://github.com/github/codeql-action/security/advisories/GHSA-vqf5-2xx6-9wfm) 的 Action 修复点为 3.28.3，本次 v4.39.1 不在其列出的 Action 受影响区间；这不抵消其他依赖告警。
-- Pillow [FPX JPEG 解码公告](https://github.com/python-pillow/Pillow/security/advisories/GHSA-5x8w-8jj5-q52h) 修复于 13.0.0，利用需要恶意 FPX 与相应解析路径。本图标脚本只绘图并读取自身生成 PNG，不接收上传图片；实际 Pillow 未固定，因此列为依赖管理问题而非本插件确认可利用的 Critical。
-- 锁文件内有已弃用的 uuid 3.4.0、@types/glob 9.0.0、旧 ESLint 8.57.1 及配套包、rimraf 3.0.2。它们属于工具链，不随扩展安装。未发现顶层依赖名称疑似仿冒，但未对每位上游维护者身份作认证。[checkout 安全页](https://github.com/actions/checkout/security)、[release 安全页](https://github.com/softprops/action-gh-release/security)、[attest 官方迁移说明](https://github.com/actions/attest-build-provenance)
+## 五、密钥与凭据检查
 
-当前只检查了上游锁文件，未宣称已经解包、重建并验证每个上游发布 bundle。最终工具链方案确定后需重新安装、扫描、测试、重建和核对实际包含的版本。
+扫描配置、测试、示例、注释、文档、构建产物及 Git 可达历史，输出位置而非值。检查 GitHub/云服务 Key、私钥、常见 Token、凭据 URL、Webhook 和赋值模式；检查 .env/私钥类文件是否被追踪及忽略。
 
-## 四、密钥与敏感数据
+本轮未发现待处理的代码凭据命中；.env/.env.local/.pem/.key 等已忽略，没有受控敏感配置文件。公开 mock 密码及 PEM 解析器头标记有逐项审核说明，不当作真实密钥。项目无需凭据配置，不人为增加无用途 .env.example。
 
-`scripts/scan-secrets.cjs` 扫描源码、配置、测试、文档、dist 和完整历史，覆盖 GitHub/云服务常见 Key、私钥、带凭据 URI、Webhook 和疑似硬编码密码。首次扫描 64 个文本对象，报告加入后复扫 68 个文本对象，10 次提交、34 个去重历史 blob，命中 0；没有受版本控制的 .env / 私钥文件，.env、.env.local、*.key、*.pem 均被忽略。
+**以前粘贴到聊天中的 GitHub Token 属于已经暴露的凭据。必须到 GitHub 作废；重新登录或仅删除文字都不等于撤销旧 Token。本审核未验证其撤销状态，也没有使用该 Token。** 新发布使用 GitHub Actions 短期凭据及 OIDC，不把个人 Token 写入代码或发布物。
 
-没有发现需要改为环境变量的应用密钥，因此不制造一个无用途的 .env.example。扫描是启发式检查，不能保证识别任意未知格式。先前聊天中曾公开过的 GitHub Token 不在此次代码扫描结果中；必须在 GitHub 撤销旧 Token，删除聊天或代码不能使其失效。未使用或自动轮换该旧凭据。
+## 六、验证结果与可复现入口
 
-## 五、验证与未完成事项
+|检查|结果/范围|
+|---|---|
+|根目录测试|36 项通过（含媒体/授权/打包及 2 项 SARIF 门禁测试）|
+|维护工具安全回归|17 项通过|
+|attest 上游及新增文件读取测试|234 项通过；类型检查、ESLint 通过|
+|release 上游测试|180 项通过；类型检查通过|
+|Pillow 图标工具测试|1 项通过，三个原 PNG 未变化|
+|npm audit|根目录、attest、release：全部等级 0|
+|OSV 精确版本查询|821 个去重公共 npm 版本及 Pillow，共 822 项，无匹配|
+|bundle 核对|现场重建；锁文件、实装版本、构建输入及本地补丁字节一致|
+|浏览器合成集成测试|8 项断言通过，Chromium 153.0.8010.12，选择 10 个标签页（1 源+9 接收），第 11 个不接收；停止后 10 路都结束|
+|密钥扫描|项目及可达历史无未处理命中；已确认测试值单独列明|
+|远端最终 CodeQL / Release|待完成验收并补充下节链接|
 
-已通过：
+浏览器测试使用合成 Canvas 代替真实屏幕选择、拦截 Facebook/Messenger 网络页面、局域 ICE；Windows headless 下用测试替身替代窗口布局/显示器 API。它使用真实 PeerConnection，但不代表真实 FB 服务端、实体桌面选取、跨网络或高负载十通话体验已验证，也不证明十路音频效果。不会为测试捕获你的桌面或拨打真实通话。
 
-- Node 原生测试 34/34（消息身份、目标/角色/会话限制、选择范围、取消、克隆停止、候选上限、日志脱敏、打包路径/硬链接/目录链接/ZIP 白名单等）。
-- Chromium 153.0.8010.12 隔离回归 8 项：11 个模拟通话发现；选择 10 个（1 源 + 9 接收）建立真实 PeerConnection；第 11 个不收流；原生捕获替身只调用一次；未选中目标伪造消息不扩大集合；停止全部 10 个已交付流；没有捕获错误。
-- 浏览器测试仅替换原生捕获为 canvas 合成流、ICE 为本地直连；Windows headless 不支持本次原生窗口管理调用，测试替身禁用窗口调整/显示器查询。**真实屏幕选择框、原生窗口调整、线上 Messenger 当前 DOM、多台机器及长期通话尚未实测**。
-- 根目录 npm audit 0 条，11 文件构建通过；Python AST 语法检查通过，未安装/运行新的 Pillow，也未改图标。
-- `git diff --check` 通过。远端 CodeQL、Release 工作流、签名证明和下载包一致性尚未运行，因为未推送/发布。
+主要命令：根目录 npm test / npm run build；node release-tools/security.test.cjs（推荐 node --test）；各工具自己的 test/typecheck/package/build；node release-tools/verify.cjs；配置隔离 npm 后 node scripts/audit-dependencies.cjs；node scripts/scan-secrets.cjs。浏览器测试需单独提供 Playwright 和浏览器路径；图标测试在固定 Pillow 的独立 Python 环境执行。
 
-## 六、需要开发者决定与建议
+## 七、开发者决定与剩余风险
 
-1. **发布工具链大版本升级/本地维护**：建议复用此前“浏览器拉线助手”已维护的新版 attest/release 工具，逐项核对本项目、锁定依赖和提交、重跑测试；CodeQL 的依赖也需修复或确认不受影响。备选：保留本轮兼容加固，暂不发布，等待上游完整修复。维护版本意味着以后持续跟进上游，不能只看 npm audit=0。
-2. **可选图标工具**：建议在单独开发依赖清单锁定 Pillow 13.0.0，隔离测试绘图函数，不重新生成现有图标。备选：暂时不运行该脚本并保留待确认项；删除工具属于删功能，未经同意不做。
-3. 真实会议兼容性、被授权网页本身的信任、STUN 元数据、后台重启内存状态、浏览器未知漏洞、仓库账号及 runner 权限属于剩余边界。不要以本报告承诺绝对安全、永不误报或已经通过商店/第三方平台审核。
+本轮所需工具升级/维护及 Pillow 升级已经获批，无待批准的业务功能删除或音频逻辑改造。没有擅自轮换凭据，没有替用户修改仓库治理规则。
 
-确认上述工具链方案后，再完成所有扫描和测试、个人仓库推送及 v2.6.18 发布，最终报告应补齐源码提交、工作流链接、ZIP SHA-256、来源证明验证和剩余告警处理结论。当前没有伪造这些尚未发生的结果。
+仍需关注：
+
+1. 确认旧聊天 Token 已撤销。代码扫描通过不能替代账户审计。
+2. 已授权网站及浏览器、系统、GitHub runner、固定二进制仍需信任；同页恶意脚本和已接收媒体不可由本插件完全控制。
+3. 生产 WebRTC 保留 Google STUN，可能暴露连接所需的 IP/网络元数据；不是纯离线工具。
+4. 发布作业具备签发/上传权限。与验证作业已分开，但发布作业仍需重新构建工具，未实现进程级 Token/OIDC 隔离；不声称达到未验证的 SLSA 等级。
+5. 本地维护补丁、旧兼容测试依赖、锁文件需持续跟进公告；扫描为当日快照，不是永久安全承诺。
+6. 开发者模式加载的 ZIP 不会自动更新。迁移个人仓库后应重新下载新包、重新加载扩展并刷新已有通话页；组织旧版不再更新。
+7. 建议对真实 Facebook/Messenger、多显示器、Chrome/Edge/Brave 当前版本和多通话负载做一次用户验收；该项尚待确认。
+
+## 八、发布证据
+
+待通过最终远端检查后填写发布标签、提交、工作流、附件 SHA-256 及 GitHub 来源证明验证结果。不手动跳过失败检查，不移动已发布版本标签。
