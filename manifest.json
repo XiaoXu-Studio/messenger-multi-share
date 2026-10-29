@@ -1,9 +1,9 @@
 {
   "manifest_version": 3,
   "name": "通话共享助手",
-  "version": "2.6.17",
+  "version": "2.6.18",
   "description": "批量共享+批量开摄像头",
-  "permissions": ["tabs", "activeTab", "scripting", "windows", "system.display"],
+  "permissions": ["scripting", "system.display"],
   "host_permissions": [
     "https://www.messenger.com/*",
     "https://www.facebook.com/*"
@@ -39,7 +39,7 @@
         "https://www.messenger.com/*",
         "https://www.facebook.com/*"
       ],
-      "js": ["content.js"],
+      "js": ["security.js", "content.js"],
       "run_at": "document_idle"
     }
   ]

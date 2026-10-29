@@ -1,0 +1,2591 @@
+import {
+  asset,
+  findTagFromReleases,
+  finalizeRelease,
+  GitHubReleaser,
+  listReleaseAssets,
+  mimeOrDefault,
+  release,
+  Release,
+  Releaser,
+  upload,
+} from '../src/github';
+
+import { mkdtempSync, rmSync, writeFileSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
+import { afterEach, assert, describe, expect, it, vi } from 'vitest';
+
+const unexpected = (method: string) =>
+  vi.fn().mockRejectedValue(new Error(`Unexpected ${method} call`));
+
+const createReleaser = (overrides: Partial<Releaser> = {}): Releaser => ({
+  getReleaseByTag: unexpected('getReleaseByTag'),
+  createRelease: unexpected('createRelease'),
+  updateRelease: unexpected('updateRelease'),
+  finalizeRelease: unexpected('finalizeRelease'),
+  allReleases: async function* () {
+    throw new Error('Unexpected allReleases call');
+  },
+  listReleaseAssets: unexpected('listReleaseAssets'),
+  deleteReleaseAsset: unexpected('deleteReleaseAsset'),
+  deleteRelease: unexpected('deleteRelease'),
+  updateReleaseAsset: unexpected('updateReleaseAsset'),
+  uploadReleaseAsset: unexpected('uploadReleaseAsset'),
+  ...overrides,
+});
+
+describe('github', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  const config = {
+    github_token: 'test-token',
+    github_ref: 'refs/tags/v1.0.0',
+    github_repository: 'owner/repo',
+    input_tag_name: undefined,
+    input_name: undefined,
+    input_body: undefined,
+    input_body_path: undefined,
+    input_files: [],
+    input_draft: undefined,
+    input_prerelease: undefined,
+    input_preserve_order: undefined,
+    input_overwrite_files: undefined,
+    input_fail_on_unmatched_files: false,
+    input_target_commitish: undefined,
+    input_discussion_category_name: undefined,
+    input_generate_release_notes: false,
+    input_previous_tag: undefined,
+    input_append_body: false,
+    input_make_latest: undefined,
+  };
+
+  describe('mimeOrDefault', () => {
+    it('returns a specific mime for common path', async () => {
+      assert.equal(mimeOrDefault('foo.tar.gz'), 'application/gzip');
+    });
+    it('returns default mime for uncommon path', async () => {
+      assert.equal(mimeOrDefault('foo.uncommon'), 'application/octet-stream');
+    });
+  });
+
+  describe('asset', () => {
+    it('derives asset info from a path', async () => {
+      const { name, mime, size } = asset('tests/data/foo/bar.txt');
+      assert.equal(name, 'bar.txt');
+      assert.equal(mime, 'text/plain');
+      assert.equal(size, 10);
+    });
+  });
+
+  describe('findTagFromReleases', () => {
+    const owner = 'owner';
+    const repo = 'repo';
+
+    const mockRelease: Release = {
+      id: 1,
+      upload_url: `https://api.github.com/repos/${owner}/${repo}/releases/1/assets`,
+      html_url: `https://github.com/${owner}/${repo}/releases/tag/v1.0.0`,
+      tag_name: 'v1.0.0',
+      name: 'Test Release',
+      body: 'Test body',
+      target_commitish: 'main',
+      draft: false,
+      prerelease: false,
+      assets: [],
+    } as const;
+
+    const mockReleaser: Releaser = {
+      getReleaseByTag: () => Promise.reject({ status: 404 }),
+      createRelease: () => Promise.reject('Not implemented'),
+      updateRelease: () => Promise.reject('Not implemented'),
+      finalizeRelease: () => Promise.reject('Not implemented'),
+      allReleases: async function* () {
+        yield { data: [mockRelease] };
+      },
+      listReleaseAssets: () => Promise.reject('Not implemented'),
+      deleteReleaseAsset: () => Promise.reject('Not implemented'),
+      deleteRelease: () => Promise.reject('Not implemented'),
+      updateReleaseAsset: () => Promise.reject('Not implemented'),
+      uploadReleaseAsset: () => Promise.reject('Not implemented'),
+    } as const;
+
+    it('finds a release by tag using direct API lookup', async () => {
+      const targetTag = 'v1.0.0';
+      const targetRelease = {
+        ...mockRelease,
+        tag_name: targetTag,
+      };
+
+      const releaser = {
+        ...mockReleaser,
+        getReleaseByTag: () => Promise.resolve({ data: targetRelease }),
+      };
+
+      const result = await findTagFromReleases(releaser, owner, repo, targetTag);
+
+      assert.deepStrictEqual(result, targetRelease);
+    });
+
+    it('falls back to paginated releases when the direct lookup cannot see a draft', async () => {
+      const draftRelease = { ...mockRelease, draft: true };
+      const pageAfterMatch = vi.fn();
+      const releaser = {
+        ...mockReleaser,
+        allReleases: async function* () {
+          yield { data: [{ ...mockRelease, tag_name: 'other' }] };
+          yield { data: [draftRelease] };
+          pageAfterMatch();
+          yield { data: [] };
+        },
+      };
+
+      const result = await findTagFromReleases(releaser, owner, repo, draftRelease.tag_name);
+
+      assert.strictEqual(result, draftRelease);
+      expect(pageAfterMatch).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ['a top-level 404', { status: 404 }],
+      ['a nested response 404', { response: { status: 404 } }],
+      [
+        'an invalid top-level status with a nested response 404',
+        { status: '500', response: { status: 404 } },
+      ],
+    ])('uses release-list fallback for %s', async (_name, lookupError) => {
+      const draftRelease = { ...mockRelease, draft: true };
+      const allReleases = vi.fn(async function* () {
+        yield { data: [draftRelease] };
+      });
+      const releaser = {
+        ...mockReleaser,
+        getReleaseByTag: vi.fn().mockRejectedValue(lookupError),
+        allReleases,
+      };
+
+      await expect(findTagFromReleases(releaser, owner, repo, draftRelease.tag_name)).resolves.toBe(
+        draftRelease,
+      );
+      expect(allReleases).toHaveBeenCalledOnce();
+    });
+
+    it.each([
+      ['a nested response 500', { response: { status: 500 } }],
+      ['a string top-level status', { status: '404' }],
+      ['a string nested response status', { response: { status: '404' } }],
+      ['a status-less object', { reason: 'lookup failed' }],
+      [
+        'a numeric top-level 500 with a nested response 404',
+        { status: 500, response: { status: 404 } },
+      ],
+    ])('does not use release-list fallback for %s', async (_name, lookupError) => {
+      const allReleases = vi.fn(async function* () {
+        yield { data: [mockRelease] };
+      });
+      const releaser = {
+        ...mockReleaser,
+        getReleaseByTag: vi.fn().mockRejectedValue(lookupError),
+        allReleases,
+      };
+
+      await expect(findTagFromReleases(releaser, owner, repo, mockRelease.tag_name)).rejects.toBe(
+        lookupError,
+      );
+      expect(allReleases).not.toHaveBeenCalled();
+    });
+
+    it('does not exhaust pagination while checking a brand-new tag', async () => {
+      let pagesRead = 0;
+      const releaser = {
+        ...mockReleaser,
+        allReleases: async function* () {
+          pagesRead += 1;
+          yield { data: [] };
+          pagesRead += 1;
+          yield { data: [] };
+          throw new Error('Only the first 10000 results are available');
+        },
+      };
+
+      const result = await findTagFromReleases(releaser, owner, repo, 'brand-new-tag');
+
+      expect(result).toBeUndefined();
+      expect(pagesRead).toBe(2);
+    });
+
+    it('selects the canonical draft without deleting a pre-existing duplicate', async () => {
+      const canonicalDraft: Release = {
+        ...mockRelease,
+        id: 1,
+        draft: true,
+        assets: [{ id: 99, name: 'existing.zip' }],
+      };
+      const duplicateDraft: Release = {
+        ...canonicalDraft,
+        id: 2,
+        name: 'manually authored draft',
+        body: 'notes that must not be deleted',
+        assets: [],
+      };
+      const deleteRelease = vi.fn().mockResolvedValue(undefined);
+      const releaser = {
+        ...mockReleaser,
+        allReleases: async function* () {
+          yield { data: [duplicateDraft, canonicalDraft] };
+        },
+        deleteRelease,
+      };
+
+      const result = await findTagFromReleases(releaser, owner, repo, canonicalDraft.tag_name);
+
+      expect(result).toBe(canonicalDraft);
+      expect(deleteRelease).not.toHaveBeenCalled();
+    });
+
+    it('retries draft discovery when GitHub release listing is briefly stale', async () => {
+      vi.useFakeTimers();
+      const draftRelease = { ...mockRelease, draft: true };
+      let listingAttempt = 0;
+      const releaser = {
+        ...mockReleaser,
+        allReleases: async function* () {
+          listingAttempt += 1;
+          yield { data: listingAttempt === 1 ? [] : [draftRelease] };
+        },
+      };
+
+      const resultPromise = findTagFromReleases(releaser, owner, repo, draftRelease.tag_name, 2);
+      await vi.advanceTimersByTimeAsync(1000);
+
+      await expect(resultPromise).resolves.toBe(draftRelease);
+      expect(listingAttempt).toBe(2);
+    });
+
+    it('returns undefined when release is not found (404)', async () => {
+      const releaser = {
+        ...mockReleaser,
+        getReleaseByTag: () => Promise.reject({ status: 404 }),
+      };
+
+      const result = await findTagFromReleases(releaser, owner, repo, 'nonexistent');
+
+      assert.strictEqual(result, undefined);
+    });
+
+    it('re-throws non-404 errors', async () => {
+      const releaser = {
+        ...mockReleaser,
+        getReleaseByTag: () => Promise.reject({ status: 500, message: 'Server error' }),
+      };
+
+      try {
+        await findTagFromReleases(releaser, owner, repo, 'v1.0.0');
+        assert.fail('Expected an error to be thrown');
+      } catch (error) {
+        assert.strictEqual(error.status, 500);
+      }
+    });
+
+    it('re-throws errors from the draft listing fallback', async () => {
+      const listingError = new Error('release listing failed');
+      const releaser = {
+        ...mockReleaser,
+        allReleases: async function* () {
+          throw listingError;
+        },
+      };
+
+      await expect(findTagFromReleases(releaser, owner, repo, 'v1.0.0')).rejects.toBe(listingError);
+    });
+
+    it('finds a release with empty tag name', async () => {
+      const emptyTag = '';
+      const targetRelease = {
+        ...mockRelease,
+        tag_name: emptyTag,
+      };
+
+      const releaser = {
+        ...mockReleaser,
+        getReleaseByTag: () => Promise.resolve({ data: targetRelease }),
+      };
+
+      const result = await findTagFromReleases(releaser, owner, repo, emptyTag);
+
+      assert.deepStrictEqual(result, targetRelease);
+    });
+  });
+
+  describe('listReleaseAssets', () => {
+    const releaseToInspect: Release = {
+      id: 42,
+      upload_url: 'https://uploads.example.test/releases/42/assets',
+      html_url: 'https://example.test/releases/42',
+      tag_name: 'v1.0.0',
+      name: 'v1.0.0',
+      target_commitish: 'main',
+      draft: false,
+      prerelease: false,
+      assets: [],
+    };
+
+    it('returns assets with the repository and release parameters', async () => {
+      const assets = [{ id: 7, name: 'action.zip' }];
+      const listReleaseAssetsSpy = vi.fn().mockResolvedValue(assets);
+      const releaser = createReleaser({ listReleaseAssets: listReleaseAssetsSpy });
+
+      await expect(listReleaseAssets(config, releaser, releaseToInspect)).resolves.toBe(assets);
+      expect(listReleaseAssetsSpy).toHaveBeenCalledOnce();
+      expect(listReleaseAssetsSpy).toHaveBeenCalledWith({
+        owner: 'owner',
+        repo: 'repo',
+        release_id: 42,
+      });
+    });
+
+    it('retries a transient failure and then succeeds', async () => {
+      const assets = [{ id: 7, name: 'action.zip' }];
+      const listReleaseAssetsSpy = vi
+        .fn()
+        .mockRejectedValueOnce(new Error('temporary failure'))
+        .mockResolvedValueOnce(assets);
+      const releaser = createReleaser({ listReleaseAssets: listReleaseAssetsSpy });
+
+      await expect(listReleaseAssets(config, releaser, releaseToInspect, 2)).resolves.toBe(assets);
+      expect(listReleaseAssetsSpy).toHaveBeenCalledTimes(2);
+    });
+
+    it('stops after exhausting the configured attempts', async () => {
+      const listReleaseAssetsSpy = vi.fn().mockRejectedValue(new Error('persistent failure'));
+      const releaser = createReleaser({ listReleaseAssets: listReleaseAssetsSpy });
+
+      await expect(listReleaseAssets(config, releaser, releaseToInspect, 2)).rejects.toThrow(
+        'Too many retries.',
+      );
+      expect(listReleaseAssetsSpy).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  describe('GitHubReleaser', () => {
+    it('uses GitHub standard asset deletion without adding the release ID', async () => {
+      const deleteReleaseAsset = vi.fn().mockResolvedValue(undefined);
+      const request = vi.fn();
+      const releaser = new GitHubReleaser({
+        rest: { repos: { deleteReleaseAsset } },
+        request,
+      } as any);
+
+      await releaser.deleteReleaseAsset({
+        owner: 'owner',
+        repo: 'repo',
+        release_id: 42,
+        asset_id: 99,
+      });
+
+      expect(deleteReleaseAsset).toHaveBeenCalledOnce();
+      expect(deleteReleaseAsset).toHaveBeenCalledWith({
+        owner: 'owner',
+        repo: 'repo',
+        asset_id: 99,
+      });
+      expect(request).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      {
+        name: 'top-level status',
+        deletionError: { status: 404, message: 'standard route not found' },
+      },
+      {
+        name: 'nested response status',
+        deletionError: {
+          response: { status: 404 },
+          message: 'standard route not found',
+        },
+      },
+    ])('falls back to release-scoped asset deletion after a 404 with $name', async (testCase) => {
+      const deleteReleaseAsset = vi.fn().mockRejectedValue(testCase.deletionError);
+      const request = vi.fn().mockResolvedValue({ status: 204 });
+      const releaser = new GitHubReleaser({
+        rest: { repos: { deleteReleaseAsset } },
+        request,
+      } as any);
+
+      await releaser.deleteReleaseAsset({
+        owner: 'owner',
+        repo: 'repo',
+        release_id: 42,
+        asset_id: 99,
+      });
+
+      expect(request).toHaveBeenCalledOnce();
+      expect(request).toHaveBeenCalledWith(
+        'DELETE /repos/{owner}/{repo}/releases/{release_id}/assets/{asset_id}',
+        {
+          owner: 'owner',
+          repo: 'repo',
+          release_id: 42,
+          asset_id: 99,
+        },
+      );
+    });
+
+    it.each([
+      ['a string', 'not found'],
+      ['null', null],
+      ['an arbitrary object', { response: { data: 'not found' } }],
+    ])('does not misclassify %s as a fallback 404', async (_name, deletionError) => {
+      const request = vi.fn();
+      const releaser = new GitHubReleaser({
+        rest: {
+          repos: { deleteReleaseAsset: vi.fn().mockRejectedValue(deletionError) },
+        },
+        request,
+      } as any);
+
+      await expect(
+        releaser.deleteReleaseAsset({
+          owner: 'owner',
+          repo: 'repo',
+          release_id: 42,
+          asset_id: 99,
+        }),
+      ).rejects.toBe(deletionError);
+      expect(request).not.toHaveBeenCalled();
+    });
+
+    it('does not mask non-404 asset deletion failures', async () => {
+      const deletionError = { status: 403, message: 'forbidden' };
+      const request = vi.fn();
+      const releaser = new GitHubReleaser({
+        rest: {
+          repos: { deleteReleaseAsset: vi.fn().mockRejectedValue(deletionError) },
+        },
+        request,
+      } as any);
+
+      await expect(
+        releaser.deleteReleaseAsset({
+          owner: 'owner',
+          repo: 'repo',
+          release_id: 42,
+          asset_id: 99,
+        }),
+      ).rejects.toBe(deletionError);
+      expect(request).not.toHaveBeenCalled();
+    });
+
+    it('reports both failures when release-scoped deletion also fails', async () => {
+      const releaser = new GitHubReleaser({
+        rest: {
+          repos: {
+            deleteReleaseAsset: vi
+              .fn()
+              .mockRejectedValue({ status: 404, message: 'standard route not found' }),
+          },
+        },
+        request: vi
+          .fn()
+          .mockRejectedValue({ status: 404, message: 'release-scoped route not found' }),
+      } as any);
+
+      await expect(
+        releaser.deleteReleaseAsset({
+          owner: 'owner',
+          repo: 'repo',
+          release_id: 42,
+          asset_id: 99,
+        }),
+      ).rejects.toThrow(
+        'Failed to delete release asset 99. GitHub endpoint: standard route not found; release-scoped endpoint: release-scoped route not found',
+      );
+    });
+
+    it('passes previous_tag_name to generateReleaseNotes and strips it from createRelease', async () => {
+      const generateReleaseNotes = vi.fn(async () => ({
+        data: {
+          name: 'Generated release',
+          body: "## What's Changed\n* Added support for previous_tag",
+        },
+      }));
+      const createRelease = vi.fn(async (params) => ({
+        data: {
+          id: 1,
+          upload_url: 'test',
+          html_url: 'test',
+          tag_name: params.tag_name,
+          name: params.name,
+          body: params.body,
+          target_commitish: params.target_commitish || 'main',
+          draft: params.draft ?? false,
+          prerelease: params.prerelease ?? false,
+          assets: [],
+        },
+      }));
+
+      const releaser = new GitHubReleaser({
+        rest: {
+          repos: {
+            generateReleaseNotes,
+            createRelease,
+            updateRelease: vi.fn(),
+            getReleaseByTag: vi.fn(),
+            listReleaseAssets: vi.fn(),
+            deleteReleaseAsset: vi.fn(),
+            deleteRelease: vi.fn(),
+            updateReleaseAsset: vi.fn(),
+            listReleases: {
+              endpoint: {
+                merge: vi.fn(),
+              },
+            },
+          },
+        },
+        paginate: {
+          iterator: vi.fn(),
+        },
+        request: vi.fn(),
+      } as any);
+
+      await releaser.createRelease({
+        owner: 'owner',
+        repo: 'repo',
+        tag_name: 'v1.0.0',
+        name: 'v1.0.0',
+        body: 'Intro',
+        draft: false,
+        prerelease: false,
+        target_commitish: 'abc123',
+        discussion_category_name: undefined,
+        generate_release_notes: true,
+        make_latest: undefined,
+        previous_tag_name: 'v0.9.0',
+      });
+
+      expect(generateReleaseNotes).toHaveBeenCalledWith({
+        owner: 'owner',
+        repo: 'repo',
+        tag_name: 'v1.0.0',
+        target_commitish: 'abc123',
+        previous_tag_name: 'v0.9.0',
+      });
+      expect(createRelease).toHaveBeenCalledWith(
+        expect.objectContaining({
+          tag_name: 'v1.0.0',
+          body: "Intro\n\n## What's Changed\n* Added support for previous_tag",
+          generate_release_notes: false,
+        }),
+      );
+      expect(createRelease.mock.calls[0][0]).not.toHaveProperty('previous_tag_name');
+    });
+
+    it('passes discussion_category_name when finalizing a release', async () => {
+      const updateRelease = vi.fn(async () => ({
+        data: {
+          id: 1,
+          upload_url: 'test',
+          html_url: 'test',
+          tag_name: 'v1.0.0',
+          name: 'v1.0.0',
+          body: 'test',
+          target_commitish: 'main',
+          draft: false,
+          prerelease: false,
+          assets: [],
+        },
+      }));
+
+      const releaser = new GitHubReleaser({
+        rest: {
+          repos: {
+            generateReleaseNotes: vi.fn(),
+            createRelease: vi.fn(),
+            updateRelease,
+            getReleaseByTag: vi.fn(),
+            listReleaseAssets: vi.fn(),
+            deleteReleaseAsset: vi.fn(),
+            deleteRelease: vi.fn(),
+            updateReleaseAsset: vi.fn(),
+            listReleases: {
+              endpoint: {
+                merge: vi.fn(),
+              },
+            },
+          },
+        },
+        paginate: {
+          iterator: vi.fn(),
+        },
+        request: vi.fn(),
+      } as any);
+
+      await releaser.finalizeRelease({
+        owner: 'owner',
+        repo: 'repo',
+        release_id: 1,
+        make_latest: 'legacy',
+        discussion_category_name: 'Announcements',
+      });
+
+      expect(updateRelease).toHaveBeenCalledWith({
+        owner: 'owner',
+        repo: 'repo',
+        release_id: 1,
+        draft: false,
+        make_latest: 'legacy',
+        discussion_category_name: 'Announcements',
+      });
+    });
+  });
+
+  describe('finalizeRelease input_draft behavior', () => {
+    const draftRelease: Release = {
+      id: 1,
+      upload_url: 'test',
+      html_url: 'test',
+      tag_name: 'v1.0.0',
+      name: 'test',
+      body: 'test',
+      target_commitish: 'main',
+      draft: true,
+      prerelease: false,
+      assets: [],
+    };
+
+    const finalizedRelease: Release = {
+      ...draftRelease,
+      draft: false,
+    };
+    const publishedPrerelease: Release = {
+      ...draftRelease,
+      draft: false,
+      prerelease: true,
+    };
+
+    it.each([
+      {
+        name: 'returns early when input_draft is true',
+        input_draft: true,
+        release: draftRelease,
+        expectedCalls: 0,
+        expectedResult: draftRelease,
+      },
+      {
+        name: 'finalizes release when input_draft is false',
+        input_draft: false,
+        release: draftRelease,
+        expectedCalls: 1,
+        expectedResult: finalizedRelease,
+      },
+      {
+        name: 'returns early when release is already published',
+        input_draft: false,
+        release: publishedPrerelease,
+        expectedCalls: 0,
+        expectedResult: publishedPrerelease,
+      },
+    ])('$name', async ({ input_draft, release, expectedCalls, expectedResult }) => {
+      const finalizeReleaseSpy = vi.fn(async () => ({ data: finalizedRelease }));
+
+      const releaser: Releaser = {
+        getReleaseByTag: () => Promise.reject('Not implemented'),
+        createRelease: () => Promise.reject('Not implemented'),
+        updateRelease: () => Promise.reject('Not implemented'),
+        finalizeRelease: finalizeReleaseSpy,
+        allReleases: async function* () {
+          throw new Error('Not implemented');
+        },
+        listReleaseAssets: () => Promise.reject('Not implemented'),
+        deleteReleaseAsset: () => Promise.reject('Not implemented'),
+        deleteRelease: () => Promise.reject('Not implemented'),
+        updateReleaseAsset: () => Promise.reject('Not implemented'),
+        uploadReleaseAsset: () => Promise.reject('Not implemented'),
+      };
+
+      const result = await finalizeRelease(
+        {
+          ...config,
+          input_draft,
+        },
+        releaser,
+        release,
+      );
+
+      expect(finalizeReleaseSpy).toHaveBeenCalledTimes(expectedCalls);
+      assert.strictEqual(result, expectedResult);
+
+      if (expectedCalls === 1) {
+        expect(finalizeReleaseSpy).toHaveBeenCalledWith({
+          owner: 'owner',
+          repo: 'repo',
+          release_id: release.id,
+          make_latest: undefined,
+          discussion_category_name: undefined,
+        });
+      }
+    });
+
+    it('passes discussion_category_name through when finalizing a draft release', async () => {
+      const finalizeReleaseSpy = vi.fn(async () => ({ data: finalizedRelease }));
+
+      const releaser: Releaser = {
+        getReleaseByTag: () => Promise.reject('Not implemented'),
+        createRelease: () => Promise.reject('Not implemented'),
+        updateRelease: () => Promise.reject('Not implemented'),
+        finalizeRelease: finalizeReleaseSpy,
+        allReleases: async function* () {
+          throw new Error('Not implemented');
+        },
+        listReleaseAssets: () => Promise.reject('Not implemented'),
+        deleteReleaseAsset: () => Promise.reject('Not implemented'),
+        deleteRelease: () => Promise.reject('Not implemented'),
+        updateReleaseAsset: () => Promise.reject('Not implemented'),
+        uploadReleaseAsset: () => Promise.reject('Not implemented'),
+      };
+
+      await finalizeRelease(
+        {
+          ...config,
+          input_draft: false,
+          input_discussion_category_name: 'Announcements',
+        },
+        releaser,
+        draftRelease,
+      );
+
+      expect(finalizeReleaseSpy).toHaveBeenCalledWith({
+        owner: 'owner',
+        repo: 'repo',
+        release_id: draftRelease.id,
+        make_latest: undefined,
+        discussion_category_name: 'Announcements',
+      });
+    });
+
+    it('deletes a newly created draft when tag creation is blocked by repository rules', async () => {
+      const finalizeReleaseSpy = vi.fn(async () => {
+        throw {
+          status: 422,
+          response: {
+            data: {
+              errors: [
+                {
+                  field: 'pre_receive',
+                  message:
+                    'pre_receive Repository rule violations found\n\nCannot create ref due to creations being restricted.\n\n',
+                },
+              ],
+            },
+          },
+        };
+      });
+      const deleteReleaseSpy = vi.fn(async () => undefined);
+
+      const releaser: Releaser = {
+        getReleaseByTag: () => Promise.reject('Not implemented'),
+        createRelease: () => Promise.reject('Not implemented'),
+        updateRelease: () => Promise.reject('Not implemented'),
+        finalizeRelease: finalizeReleaseSpy,
+        allReleases: async function* () {
+          throw new Error('Not implemented');
+        },
+        listReleaseAssets: () => Promise.reject('Not implemented'),
+        deleteReleaseAsset: () => Promise.reject('Not implemented'),
+        deleteRelease: deleteReleaseSpy,
+        updateReleaseAsset: () => Promise.reject('Not implemented'),
+        uploadReleaseAsset: () => Promise.reject('Not implemented'),
+      };
+
+      await expect(
+        finalizeRelease(
+          {
+            ...config,
+            input_draft: false,
+          },
+          releaser,
+          draftRelease,
+          true,
+        ),
+      ).rejects.toThrow(
+        'Tag creation for v1.0.0 is blocked by repository rules. Deleted draft release 1 to avoid leaving an orphaned draft release.',
+      );
+
+      expect(finalizeReleaseSpy).toHaveBeenCalledTimes(1);
+      expect(deleteReleaseSpy).toHaveBeenCalledWith({
+        owner: 'owner',
+        repo: 'repo',
+        release_id: draftRelease.id,
+      });
+    });
+
+    it('does not delete an existing draft release when tag creation is blocked by repository rules', async () => {
+      const finalizeReleaseSpy = vi.fn(async () => {
+        throw {
+          status: 422,
+          response: {
+            data: {
+              errors: [
+                {
+                  field: 'pre_receive',
+                  message:
+                    'pre_receive Repository rule violations found\n\nCannot create ref due to creations being restricted.\n\n',
+                },
+              ],
+            },
+          },
+        };
+      });
+      const deleteReleaseSpy = vi.fn(async () => undefined);
+
+      const releaser: Releaser = {
+        getReleaseByTag: () => Promise.reject('Not implemented'),
+        createRelease: () => Promise.reject('Not implemented'),
+        updateRelease: () => Promise.reject('Not implemented'),
+        finalizeRelease: finalizeReleaseSpy,
+        allReleases: async function* () {
+          throw new Error('Not implemented');
+        },
+        listReleaseAssets: () => Promise.reject('Not implemented'),
+        deleteReleaseAsset: () => Promise.reject('Not implemented'),
+        deleteRelease: deleteReleaseSpy,
+        updateReleaseAsset: () => Promise.reject('Not implemented'),
+        uploadReleaseAsset: () => Promise.reject('Not implemented'),
+      };
+
+      await expect(
+        finalizeRelease(
+          {
+            ...config,
+            input_draft: false,
+          },
+          releaser,
+          draftRelease,
+          false,
+          1,
+        ),
+      ).rejects.toThrow('Too many retries.');
+
+      expect(finalizeReleaseSpy).toHaveBeenCalledTimes(1);
+      expect(deleteReleaseSpy).not.toHaveBeenCalled();
+    });
+
+    it('retries malformed tag-rule errors without deleting the draft', async () => {
+      const finalizeReleaseSpy = vi.fn().mockRejectedValue({
+        status: 422,
+        response: {
+          data: {
+            errors: [null, 'invalid', { field: 'pre_receive', message: 42 }],
+          },
+        },
+      });
+      const deleteReleaseSpy = vi.fn();
+      const releaser = createReleaser({
+        finalizeRelease: finalizeReleaseSpy,
+        deleteRelease: deleteReleaseSpy,
+      });
+
+      await expect(
+        finalizeRelease(
+          {
+            ...config,
+            input_draft: false,
+          },
+          releaser,
+          draftRelease,
+          true,
+          1,
+        ),
+      ).rejects.toThrow('Too many retries.');
+
+      expect(finalizeReleaseSpy).toHaveBeenCalledOnce();
+      expect(deleteReleaseSpy).not.toHaveBeenCalled();
+    });
+
+    it('finds a valid tag-rule violation after malformed validation entries', async () => {
+      const finalizeReleaseSpy = vi.fn().mockRejectedValue({
+        response: {
+          status: 422,
+          data: {
+            errors: [
+              null,
+              'invalid',
+              {
+                field: 'pre_receive',
+                message: 'Cannot create ref due to creations being restricted.',
+              },
+            ],
+          },
+        },
+      });
+      const deleteReleaseSpy = vi.fn().mockResolvedValue(undefined);
+      const releaser = createReleaser({
+        finalizeRelease: finalizeReleaseSpy,
+        deleteRelease: deleteReleaseSpy,
+      });
+
+      await expect(
+        finalizeRelease(
+          {
+            ...config,
+            input_draft: false,
+          },
+          releaser,
+          draftRelease,
+          true,
+          1,
+        ),
+      ).rejects.toThrow(
+        'Tag creation for v1.0.0 is blocked by repository rules. Deleted draft release 1 to avoid leaving an orphaned draft release.',
+      );
+
+      expect(finalizeReleaseSpy).toHaveBeenCalledOnce();
+      expect(deleteReleaseSpy).toHaveBeenCalledWith({
+        owner: 'owner',
+        repo: 'repo',
+        release_id: draftRelease.id,
+      });
+    });
+  });
+
+  describe('error handling', () => {
+    it.each([
+      {
+        name: 'a remote repository without a discussion category',
+        repository: 'remote-owner/release-repo',
+        category: undefined,
+      },
+      {
+        name: 'the current repository without a discussion category',
+        repository: 'owner/repo',
+        category: undefined,
+      },
+      {
+        name: 'a repository with a discussion category',
+        repository: 'owner/repo',
+        category: 'Announcements',
+      },
+    ])('classifies a create-release 404 for $name without retrying', async (testCase) => {
+      const releaseError = {
+        status: 404,
+        message: 'Not Found - create-a-release',
+      };
+      const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+      const createRelease = vi.fn().mockRejectedValue(releaseError);
+      const releaser = createReleaser({
+        getReleaseByTag: vi.fn().mockRejectedValue({ status: 404 }),
+        createRelease,
+        allReleases: async function* () {
+          yield { data: [] };
+        },
+      });
+
+      const thrown = await release(
+        {
+          ...config,
+          github_repository: testCase.repository,
+          input_discussion_category_name: testCase.category,
+        },
+        releaser,
+        1,
+      ).catch((error) => error);
+
+      expect(thrown).toMatchObject({
+        name: 'ReleaseCreationError',
+        status: 404,
+        cause: releaseError,
+      });
+      expect(thrown.message).toContain(
+        `GitHub returned 404 while creating the release. Verify that ${testCase.repository} exists under the expected owner`,
+      );
+      expect(thrown.message).toContain('the token can access it');
+      expect(thrown.message).toContain('fine-grained PAT');
+      expect(thrown.message).toContain('Contents: write');
+      expect(thrown.message).toContain('GitHub response: Not Found - create-a-release');
+      if (testCase.category) {
+        expect(thrown.message).toContain('Discussions and the requested category "Announcements"');
+      } else {
+        expect(thrown.message).not.toContain('discussion category mismatch');
+        expect(thrown.message).not.toContain('requested category');
+      }
+      expect(createRelease).toHaveBeenCalledOnce();
+      expect(log).not.toHaveBeenCalledWith(
+        expect.stringContaining('Unexpected error fetching GitHub release'),
+      );
+    });
+
+    it('classifies a draft-listing 404 as a repository access failure', async () => {
+      const listingError = {
+        status: 404,
+        message: 'Not Found - list-releases',
+      };
+      const createRelease = vi.fn();
+      const releaser = createReleaser({
+        getReleaseByTag: vi.fn().mockRejectedValue({ status: 404 }),
+        allReleases: async function* () {
+          throw listingError;
+        },
+        createRelease,
+      });
+
+      const thrown = await release(
+        {
+          ...config,
+          github_repository: 'remote-owner/release-repo',
+          input_discussion_category_name: undefined,
+        },
+        releaser,
+        1,
+      ).catch((error) => error);
+
+      expect(thrown).toMatchObject({
+        name: 'ReleaseAccessError',
+        status: 404,
+        cause: listingError,
+      });
+      expect(thrown.message).toContain('GitHub returned 404 while checking existing releases');
+      expect(thrown.message).toContain('remote-owner/release-repo');
+      expect(thrown.message).toContain('the token can access it');
+      expect(thrown.message).toContain('fine-grained PAT');
+      expect(thrown.message).toContain('Contents: write');
+      expect(thrown.message).toContain('GitHub response: Not Found - list-releases');
+      expect(thrown.message).not.toContain('discussion category mismatch');
+      expect(createRelease).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      {
+        name: 'a nested response 404 as repository access failure',
+        listingError: {
+          response: { status: 404 },
+          message: 'Not Found - list-releases',
+        },
+        expectAccessError: true,
+      },
+      {
+        name: 'a nested response 500 as the original error',
+        listingError: {
+          response: { status: 500 },
+          message: 'Server Error - list-releases',
+        },
+        expectAccessError: false,
+      },
+      {
+        name: 'a status-less object as the original error',
+        listingError: { reason: 'release listing failed' },
+        expectAccessError: false,
+      },
+    ])('classifies a release-list fallback error with $name', async (testCase) => {
+      const createRelease = vi.fn();
+      const releaser = createReleaser({
+        getReleaseByTag: vi.fn().mockRejectedValue({ status: 404 }),
+        allReleases: async function* () {
+          throw testCase.listingError;
+        },
+        createRelease,
+      });
+
+      const thrown = await release(config, releaser, 1).catch((error) => error);
+
+      if (testCase.expectAccessError) {
+        expect(thrown).toMatchObject({
+          name: 'ReleaseAccessError',
+          status: 404,
+          cause: testCase.listingError,
+        });
+      } else {
+        expect(thrown).toBe(testCase.listingError);
+      }
+      expect(createRelease).not.toHaveBeenCalled();
+    });
+
+    it('reports a useful create error without assuming response data exists', async () => {
+      const releaseError = {
+        status: 403,
+        message: 'Resource not accessible by integration',
+      };
+      const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+      const releaser = createReleaser({
+        getReleaseByTag: vi.fn().mockRejectedValue({ status: 404 }),
+        createRelease: vi.fn().mockRejectedValue(releaseError),
+        allReleases: async function* () {
+          yield { data: [] };
+        },
+      });
+
+      await expect(release(config, releaser, 1)).rejects.toBe(releaseError);
+      expect(log).toHaveBeenCalledWith('⚠️ GitHub release failed with status: 403');
+      expect(log).toHaveBeenCalledWith('Resource not accessible by integration');
+      expect(log).not.toHaveBeenCalledWith('undefined');
+    });
+
+    it.each([
+      {
+        name: 'a nested response 403',
+        releaseError: {
+          response: { status: 403 },
+          message: 'Resource not accessible by integration',
+        },
+      },
+      {
+        name: 'a nested response 422 without already_exists',
+        releaseError: {
+          response: { status: 422, data: { errors: [{ code: 'invalid' }] } },
+          message: 'Validation Failed',
+        },
+      },
+    ])('does not retry release creation for $name', async (testCase) => {
+      const createRelease = vi.fn().mockRejectedValue(testCase.releaseError);
+      const releaser = createReleaser({
+        getReleaseByTag: vi.fn().mockRejectedValue({ status: 404 }),
+        createRelease,
+        allReleases: async function* () {
+          yield { data: [] };
+        },
+      });
+
+      await expect(release(config, releaser, 1)).rejects.toBe(testCase.releaseError);
+      expect(createRelease).toHaveBeenCalledOnce();
+    });
+
+    it('classifies a nested response 404 from release creation without retrying', async () => {
+      const releaseError = {
+        response: { status: 404 },
+        message: 'Not Found - create-a-release',
+      };
+      const createRelease = vi.fn().mockRejectedValue(releaseError);
+      const releaser = createReleaser({
+        getReleaseByTag: vi.fn().mockRejectedValue({ status: 404 }),
+        createRelease,
+        allReleases: async function* () {
+          yield { data: [] };
+        },
+      });
+
+      const thrown = await release(config, releaser, 1).catch((error) => error);
+
+      expect(thrown).toMatchObject({
+        name: 'ReleaseCreationError',
+        status: 404,
+        cause: releaseError,
+      });
+      expect(thrown.message).toContain('GitHub returned 404 while creating the release');
+      expect(createRelease).toHaveBeenCalledOnce();
+    });
+
+    it.each([
+      ['non-object response data', { status: 422, response: { data: 'invalid' } }],
+      ['missing validation errors', { status: 422, response: { data: {} } }],
+      ['malformed validation errors', { status: 422, response: { data: { errors: [null] } } }],
+    ])('does not retry a permanent 422 with %s', async (_name, releaseError) => {
+      const createRelease = vi.fn().mockRejectedValue(releaseError);
+      const releaser = createReleaser({
+        getReleaseByTag: vi.fn().mockRejectedValue({ status: 404 }),
+        createRelease,
+        allReleases: async function* () {
+          yield { data: [] };
+        },
+      });
+
+      await expect(release(config, releaser, 1)).rejects.toBe(releaseError);
+      expect(createRelease).toHaveBeenCalledOnce();
+    });
+
+    it.each([
+      ['a string', 'transport failed'],
+      ['null', null],
+      ['an arbitrary object', { reason: 'transport failed' }],
+      ['a nested response 500', { response: { status: 500 } }],
+    ])(
+      'retries unclassified release creation failures without secondary TypeErrors when the error is %s',
+      async (_name, releaseError) => {
+        const createRelease = vi.fn().mockRejectedValue(releaseError);
+        const releaser = createReleaser({
+          getReleaseByTag: vi.fn().mockRejectedValue({ status: 404 }),
+          createRelease,
+          allReleases: async function* () {
+            yield { data: [] };
+          },
+        });
+
+        await expect(release(config, releaser, 1)).rejects.toThrow('Too many retries.');
+        expect(createRelease).toHaveBeenCalledOnce();
+      },
+    );
+
+    it('passes previous_tag_name through when creating a release with generated notes', async () => {
+      const createReleaseSpy = vi.fn(async () => ({
+        data: {
+          id: 1,
+          upload_url: 'test',
+          html_url: 'test',
+          tag_name: 'v1.0.0',
+          name: 'test',
+          body: 'generated notes',
+          target_commitish: 'main',
+          draft: true,
+          prerelease: false,
+          assets: [],
+        },
+      }));
+
+      await release(
+        {
+          ...config,
+          input_generate_release_notes: true,
+          input_previous_tag: 'v0.9.0',
+        },
+        {
+          getReleaseByTag: () => Promise.reject({ status: 404 }),
+          createRelease: createReleaseSpy,
+          updateRelease: () => Promise.reject('Not implemented'),
+          finalizeRelease: () => Promise.reject('Not implemented'),
+          allReleases: async function* () {
+            yield { data: [] };
+          },
+          listReleaseAssets: () => Promise.reject('Not implemented'),
+          deleteReleaseAsset: () => Promise.reject('Not implemented'),
+          deleteRelease: () => Promise.reject('Not implemented'),
+          updateReleaseAsset: () => Promise.reject('Not implemented'),
+          uploadReleaseAsset: () => Promise.reject('Not implemented'),
+        },
+        1,
+      );
+
+      expect(createReleaseSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          tag_name: 'v1.0.0',
+          generate_release_notes: true,
+          previous_tag_name: 'v0.9.0',
+        }),
+      );
+    });
+
+    it('passes previous_tag_name through when updating a release with generated notes', async () => {
+      const existingRelease: Release = {
+        id: 1,
+        upload_url: 'test',
+        html_url: 'test',
+        tag_name: 'v1.0.0',
+        name: 'test',
+        body: 'existing body',
+        target_commitish: 'main',
+        draft: false,
+        prerelease: false,
+        assets: [],
+      };
+      const updateReleaseSpy = vi.fn(async () => ({ data: existingRelease }));
+
+      await release(
+        {
+          ...config,
+          input_generate_release_notes: true,
+          input_previous_tag: 'v0.9.0',
+        },
+        {
+          getReleaseByTag: () => Promise.resolve({ data: existingRelease }),
+          createRelease: () => Promise.reject('Not implemented'),
+          updateRelease: updateReleaseSpy,
+          finalizeRelease: () => Promise.reject('Not implemented'),
+          allReleases: async function* () {
+            yield { data: [existingRelease] };
+          },
+          listReleaseAssets: () => Promise.reject('Not implemented'),
+          deleteReleaseAsset: () => Promise.reject('Not implemented'),
+          deleteRelease: () => Promise.reject('Not implemented'),
+          updateReleaseAsset: () => Promise.reject('Not implemented'),
+          uploadReleaseAsset: () => Promise.reject('Not implemented'),
+        },
+        1,
+      );
+
+      expect(updateReleaseSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          release_id: existingRelease.id,
+          generate_release_notes: true,
+          previous_tag_name: 'v0.9.0',
+        }),
+      );
+    });
+
+    it('creates published prereleases without the forced draft-first path', async () => {
+      const prereleaseConfig = {
+        ...config,
+        input_prerelease: true,
+        input_draft: false,
+      };
+      const createdRelease: Release = {
+        id: 1,
+        upload_url: 'test',
+        html_url: 'test',
+        tag_name: 'v1.0.0',
+        name: 'test',
+        body: 'test',
+        target_commitish: 'main',
+        draft: false,
+        prerelease: true,
+        assets: [],
+      };
+
+      let created = false;
+      const createReleaseSpy = vi.fn(async () => {
+        created = true;
+        return { data: createdRelease };
+      });
+      const mockReleaser: Releaser = {
+        getReleaseByTag: () => Promise.reject({ status: 404 }),
+        createRelease: createReleaseSpy,
+        updateRelease: () => Promise.reject('Not implemented'),
+        finalizeRelease: () => Promise.reject('Not implemented'),
+        allReleases: async function* () {
+          yield { data: created ? [createdRelease] : [] };
+        },
+        listReleaseAssets: () => Promise.reject('Not implemented'),
+        deleteReleaseAsset: () => Promise.reject('Not implemented'),
+        deleteRelease: () => Promise.reject('Not implemented'),
+        updateReleaseAsset: () => Promise.reject('Not implemented'),
+        uploadReleaseAsset: () => Promise.reject('Not implemented'),
+      } as const;
+
+      const result = await release(prereleaseConfig, mockReleaser, 1);
+
+      assert.equal(result.release.id, createdRelease.id);
+      assert.equal(result.created, true);
+      expect(createReleaseSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          draft: false,
+          prerelease: true,
+        }),
+      );
+    });
+
+    it('reuses a published prerelease found by listing after direct tag lookup returns 404', async () => {
+      const existingRelease: Release = {
+        id: 77,
+        upload_url: 'existing-upload',
+        html_url: 'existing-html',
+        tag_name: 'v1.0.0',
+        name: 'nightly',
+        body: 'previous nightly body',
+        target_commitish: 'old-commit',
+        draft: false,
+        prerelease: true,
+        assets: [{ id: 5, name: 'nightly.zip' }],
+      };
+      const updatedRelease: Release = {
+        ...existingRelease,
+        name: 'updated nightly',
+        body: 'updated nightly body',
+        target_commitish: 'new-commit',
+      };
+      const createRelease = unexpected('createRelease');
+      const updateRelease = vi.fn().mockResolvedValue({ data: updatedRelease });
+      const releaser = createReleaser({
+        getReleaseByTag: vi.fn().mockRejectedValue({ status: 404 }),
+        allReleases: async function* () {
+          yield { data: [existingRelease] };
+        },
+        createRelease,
+        updateRelease,
+      });
+
+      const result = await release(
+        {
+          ...config,
+          input_name: 'updated nightly',
+          input_body: 'updated nightly body',
+          input_prerelease: true,
+          input_draft: false,
+          input_target_commitish: 'new-commit',
+        },
+        releaser,
+      );
+
+      expect(result).toEqual({ release: updatedRelease, created: false });
+      expect(updateRelease).toHaveBeenCalledWith(
+        expect.objectContaining({
+          release_id: existingRelease.id,
+          tag_name: existingRelease.tag_name,
+          target_commitish: 'new-commit',
+          draft: false,
+          prerelease: true,
+        }),
+      );
+      expect(createRelease).not.toHaveBeenCalled();
+    });
+
+    it('creates a replacement after an existing-release update returns a nested response 404', async () => {
+      const existingRelease: Release = {
+        id: 41,
+        upload_url: 'existing-upload',
+        html_url: 'existing-html',
+        tag_name: 'v1.0.0',
+        name: 'existing release',
+        body: 'existing body',
+        target_commitish: 'main',
+        draft: false,
+        prerelease: false,
+        assets: [],
+      };
+      const replacementRelease: Release = {
+        ...existingRelease,
+        id: 42,
+        upload_url: 'replacement-upload',
+        html_url: 'replacement-html',
+        name: 'v1.0.0',
+        body: undefined,
+        draft: true,
+      };
+      const updateError = { response: { status: 404 }, message: 'release disappeared' };
+      const getReleaseByTag = vi
+        .fn()
+        .mockResolvedValueOnce({ data: existingRelease })
+        .mockResolvedValue({ data: replacementRelease });
+      const updateRelease = vi.fn().mockRejectedValue(updateError);
+      const createRelease = vi.fn().mockResolvedValue({ data: replacementRelease });
+      const releaser = createReleaser({
+        getReleaseByTag,
+        updateRelease,
+        createRelease,
+        allReleases: async function* () {
+          yield { data: [replacementRelease] };
+        },
+      });
+
+      await expect(release(config, releaser, 1)).resolves.toEqual({
+        release: replacementRelease,
+        created: true,
+      });
+      expect(updateRelease).toHaveBeenCalledOnce();
+      expect(createRelease).toHaveBeenCalledOnce();
+      expect(createRelease).toHaveBeenCalledWith({
+        owner: 'owner',
+        repo: 'repo',
+        tag_name: 'v1.0.0',
+        name: 'v1.0.0',
+        body: undefined,
+        draft: true,
+        prerelease: undefined,
+        target_commitish: undefined,
+        discussion_category_name: undefined,
+        generate_release_notes: false,
+        make_latest: undefined,
+        previous_tag_name: undefined,
+      });
+      expect(getReleaseByTag).toHaveBeenCalledTimes(2);
+    });
+
+    it.each([
+      ['a nested response 403', { response: { status: 403 }, message: 'forbidden' }],
+      ['a nested response 500', { response: { status: 500 }, message: 'server error' }],
+    ])(
+      'does not create a replacement after an existing-release update returns %s',
+      async (_name, updateError) => {
+        const existingRelease: Release = {
+          id: 41,
+          upload_url: 'existing-upload',
+          html_url: 'existing-html',
+          tag_name: 'v1.0.0',
+          name: 'existing release',
+          body: 'existing body',
+          target_commitish: 'main',
+          draft: false,
+          prerelease: false,
+          assets: [],
+        };
+        const createRelease = vi.fn();
+        const updateRelease = vi.fn().mockRejectedValue(updateError);
+        const releaser = createReleaser({
+          getReleaseByTag: vi.fn().mockResolvedValue({ data: existingRelease }),
+          updateRelease,
+          createRelease,
+        });
+
+        await expect(release(config, releaser, 1)).rejects.toBe(updateError);
+        expect(updateRelease).toHaveBeenCalledOnce();
+        expect(createRelease).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each([
+      ['an omitted draft input', undefined],
+      ['a null-expression draft input', undefined],
+      ['an explicit false draft input', false],
+      ['an explicit true draft input', true],
+    ])('reuses an existing draft for %s', async (_name, input_draft) => {
+      const existingDraft: Release = {
+        id: 17,
+        upload_url: 'draft-upload',
+        html_url: 'draft-html',
+        tag_name: 'v1.0.0',
+        name: 'draft release',
+        body: 'draft body',
+        target_commitish: 'main',
+        draft: true,
+        prerelease: false,
+        assets: [],
+      };
+      const updatedDraft = { ...existingDraft, prerelease: true };
+      const updateRelease = vi.fn().mockResolvedValue({ data: updatedDraft });
+      const createRelease = unexpected('createRelease');
+      const deleteRelease = unexpected('deleteRelease');
+      const releaser = createReleaser({
+        getReleaseByTag: vi.fn().mockRejectedValue({ status: 404 }),
+        allReleases: async function* () {
+          yield { data: [existingDraft] };
+        },
+        createRelease,
+        updateRelease,
+        deleteRelease,
+      });
+
+      const result = await release(
+        {
+          ...config,
+          input_draft,
+          input_prerelease: true,
+        },
+        releaser,
+      );
+
+      expect(result).toEqual({ release: updatedDraft, created: false });
+      expect(updateRelease).toHaveBeenCalledWith(
+        expect.objectContaining({
+          release_id: existingDraft.id,
+          draft: true,
+          prerelease: true,
+        }),
+      );
+      expect(createRelease).not.toHaveBeenCalled();
+      expect(deleteRelease).not.toHaveBeenCalled();
+    });
+
+    it('retries upload after deleting conflicting asset on 422 already_exists race', async () => {
+      const uploadReleaseAsset = vi
+        .fn()
+        .mockRejectedValueOnce({
+          status: 422,
+          response: { data: { errors: [{ code: 'already_exists' }] } },
+        })
+        .mockResolvedValueOnce({
+          status: 201,
+          data: { id: 123, name: 'release.txt' },
+        });
+
+      const listReleaseAssets = vi.fn().mockResolvedValue([{ id: 99, name: 'release.txt' }]);
+      const deleteReleaseAsset = vi.fn().mockResolvedValue(undefined);
+
+      const mockReleaser: Releaser = {
+        getReleaseByTag: () => Promise.reject('Not implemented'),
+        createRelease: () => Promise.reject('Not implemented'),
+        updateRelease: () => Promise.reject('Not implemented'),
+        finalizeRelease: () => Promise.reject('Not implemented'),
+        allReleases: async function* () {
+          throw new Error('Not implemented');
+        },
+        listReleaseAssets,
+        deleteReleaseAsset,
+        uploadReleaseAsset,
+      };
+
+      const result = await upload(
+        config,
+        mockReleaser,
+        'https://uploads.github.com/repos/owner/repo/releases/1/assets',
+        '__tests__/release.txt',
+        [],
+        1,
+      );
+
+      expect(result).toStrictEqual({ id: 123, name: 'release.txt' });
+      expect(listReleaseAssets).toHaveBeenCalledWith({
+        owner: 'owner',
+        repo: 'repo',
+        release_id: 1,
+      });
+      expect(deleteReleaseAsset).toHaveBeenCalledWith({
+        owner: 'owner',
+        repo: 'repo',
+        release_id: 1,
+        asset_id: 99,
+      });
+      expect(uploadReleaseAsset).toHaveBeenCalledTimes(2);
+    });
+
+    it('does not upload until deletion of an existing asset succeeds', async () => {
+      const deletionError = new Error('asset deletion failed');
+      const uploadReleaseAsset = vi.fn();
+      const releaser = createReleaser({
+        deleteReleaseAsset: vi.fn().mockRejectedValue(deletionError),
+        uploadReleaseAsset,
+      });
+
+      await expect(
+        upload(
+          config,
+          releaser,
+          'https://uploads.github.com/repos/owner/repo/releases/1/assets',
+          '__tests__/release.txt',
+          [{ id: 99, name: 'release.txt' }],
+          1,
+        ),
+      ).rejects.toBe(deletionError);
+      expect(uploadReleaseAsset).not.toHaveBeenCalled();
+    });
+
+    it('skips deletion and upload when overwrite_files is false', async () => {
+      const deleteReleaseAsset = vi.fn();
+      const uploadReleaseAsset = vi.fn();
+      const releaser = createReleaser({ deleteReleaseAsset, uploadReleaseAsset });
+
+      await expect(
+        upload(
+          { ...config, input_overwrite_files: false },
+          releaser,
+          'https://uploads.github.com/repos/owner/repo/releases/1/assets',
+          '__tests__/release.txt',
+          [{ id: 99, name: 'release.txt' }],
+          1,
+        ),
+      ).resolves.toBeNull();
+      expect(deleteReleaseAsset).not.toHaveBeenCalled();
+      expect(uploadReleaseAsset).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      {
+        name: 'standard release with a nested status',
+        prerelease: undefined,
+        uploadError: {
+          response: { status: 422 },
+          message: 'Cannot upload assets to an immutable release.',
+        },
+        expected:
+          'Cannot upload asset draft-false.txt to an immutable release. GitHub only allows asset uploads before a release is published, so upload assets to a draft release before you publish it.',
+      },
+      {
+        name: 'prerelease with response data',
+        prerelease: true,
+        uploadError: {
+          status: 422,
+          response: {
+            data: {
+              message: 'Cannot upload assets to an immutable release.',
+            },
+          },
+        },
+        expected:
+          'Cannot upload asset draft-false.txt to an immutable release. GitHub only allows asset uploads before a release is published, but draft prereleases publish with the release.published event instead of release.prereleased.',
+      },
+    ])('surfaces an actionable immutable-release error for a $name', async (testCase) => {
+      const tempDir = mkdtempSync(join(tmpdir(), 'gh-release-immutable-'));
+      const assetPath = join(tempDir, 'draft-false.txt');
+      writeFileSync(assetPath, 'hello');
+
+      const uploadReleaseAsset = vi.fn().mockRejectedValue(testCase.uploadError);
+
+      const mockReleaser: Releaser = {
+        getReleaseByTag: () => Promise.reject('Not implemented'),
+        createRelease: () => Promise.reject('Not implemented'),
+        updateRelease: () => Promise.reject('Not implemented'),
+        finalizeRelease: () => Promise.reject('Not implemented'),
+        allReleases: async function* () {
+          throw new Error('Not implemented');
+        },
+        listReleaseAssets: () => Promise.resolve([]),
+        deleteReleaseAsset: () => Promise.reject('Not implemented'),
+        deleteRelease: () => Promise.reject('Not implemented'),
+        updateReleaseAsset: () => Promise.reject('Not implemented'),
+        uploadReleaseAsset,
+      };
+
+      try {
+        await expect(
+          upload(
+            {
+              ...config,
+              input_prerelease: testCase.prerelease,
+            },
+            mockReleaser,
+            'https://uploads.github.com/repos/owner/repo/releases/1/assets',
+            assetPath,
+            [],
+            1,
+          ),
+        ).rejects.toThrow(testCase.expected);
+      } finally {
+        rmSync(tempDir, { recursive: true, force: true });
+      }
+    });
+
+    it('retries upload after deleting a conflicting renamed asset matched by label', async () => {
+      const tempDir = mkdtempSync(join(tmpdir(), 'gh-release-race-dotfile-'));
+      const dotfilePath = join(tempDir, '.config');
+      writeFileSync(dotfilePath, 'config');
+
+      const uploadReleaseAsset = vi
+        .fn()
+        .mockRejectedValueOnce({
+          status: 422,
+          response: { data: { errors: [{ code: 'already_exists' }] } },
+        })
+        .mockResolvedValueOnce({
+          status: 201,
+          data: { id: 123, name: 'default.config', label: '.config' },
+        });
+
+      const listReleaseAssets = vi
+        .fn()
+        .mockResolvedValue([{ id: 99, name: 'default.config', label: '.config' }]);
+      const deleteReleaseAsset = vi.fn().mockResolvedValue(undefined);
+      const updateReleaseAsset = vi.fn().mockResolvedValue({
+        data: { id: 123, name: 'default.config', label: '.config' },
+      });
+
+      const mockReleaser: Releaser = {
+        getReleaseByTag: () => Promise.reject('Not implemented'),
+        createRelease: () => Promise.reject('Not implemented'),
+        updateRelease: () => Promise.reject('Not implemented'),
+        finalizeRelease: () => Promise.reject('Not implemented'),
+        allReleases: async function* () {
+          throw new Error('Not implemented');
+        },
+        listReleaseAssets,
+        deleteReleaseAsset,
+        deleteRelease: () => Promise.reject('Not implemented'),
+        updateReleaseAsset,
+        uploadReleaseAsset,
+      };
+
+      try {
+        const result = await upload(
+          config,
+          mockReleaser,
+          'https://uploads.github.com/repos/owner/repo/releases/1/assets',
+          dotfilePath,
+          [],
+          1,
+        );
+
+        expect(result).toStrictEqual({ id: 123, name: 'default.config', label: '.config' });
+        expect(listReleaseAssets).toHaveBeenCalledWith({
+          owner: 'owner',
+          repo: 'repo',
+          release_id: 1,
+        });
+        expect(deleteReleaseAsset).toHaveBeenCalledWith({
+          owner: 'owner',
+          repo: 'repo',
+          release_id: 1,
+          asset_id: 99,
+        });
+        expect(updateReleaseAsset).toHaveBeenCalledWith({
+          owner: 'owner',
+          repo: 'repo',
+          asset_id: 123,
+          name: 'default.config',
+          label: '.config',
+        });
+        expect(uploadReleaseAsset).toHaveBeenCalledTimes(2);
+      } finally {
+        rmSync(tempDir, { recursive: true, force: true });
+      }
+    });
+
+    it.each([
+      {
+        name: 'top-level status',
+        releaseError: {
+          status: 422,
+          response: { data: { errors: [{ code: 'already_exists' }] } },
+        },
+      },
+      {
+        name: 'nested response status',
+        releaseError: {
+          response: {
+            status: 422,
+            data: { errors: [{ code: 'already_exists' }] },
+          },
+        },
+      },
+    ])('retries a 422 already_exists race with $name', async (testCase) => {
+      vi.useFakeTimers();
+      const existingRelease = {
+        id: 1,
+        upload_url: 'test',
+        html_url: 'test',
+        tag_name: 'v1.0.0',
+        name: 'test',
+        body: 'test',
+        target_commitish: 'main',
+        draft: false,
+        prerelease: false,
+        assets: [],
+      };
+
+      let createAttempts = 0;
+      const mockReleaser: Releaser = {
+        getReleaseByTag: ({ tag }) => {
+          // First call returns 404 (release doesn't exist yet), subsequent calls find it
+          if (createAttempts === 0) {
+            return Promise.reject({ status: 404 });
+          }
+          return Promise.resolve({ data: existingRelease });
+        },
+        createRelease: () => {
+          createAttempts++;
+          return Promise.reject(testCase.releaseError);
+        },
+        updateRelease: () =>
+          Promise.resolve({
+            data: {
+              id: 1,
+              upload_url: 'test',
+              html_url: 'test',
+              tag_name: 'v1.0.0',
+              name: 'test',
+              body: 'test',
+              target_commitish: 'main',
+              draft: true,
+              prerelease: false,
+              assets: [],
+            },
+          }),
+        finalizeRelease: () => Promise.reject('Not implemented'),
+        allReleases: async function* () {
+          yield { data: createAttempts > 0 ? [existingRelease] : [] };
+        },
+        listReleaseAssets: () => Promise.reject('Not implemented'),
+        deleteReleaseAsset: () => Promise.reject('Not implemented'),
+        deleteRelease: () => Promise.reject('Not implemented'),
+        uploadReleaseAsset: () => Promise.reject('Not implemented'),
+      } as const;
+
+      const resultPromise = release(config, mockReleaser, 2);
+      await vi.advanceTimersByTimeAsync(1000);
+      const result = await resultPromise;
+      assert.ok(result);
+      assert.equal(result.release.id, 1);
+      assert.equal(result.created, false);
+      expect(createAttempts).toBe(1);
+    });
+
+    it('normalizes refs/tags-prefixed input_tag_name values before reusing an existing release', async () => {
+      const existingRelease: Release = {
+        id: 1,
+        upload_url: 'test',
+        html_url: 'test',
+        tag_name: 'v1.0.0',
+        name: 'test',
+        body: 'test',
+        target_commitish: 'main',
+        draft: false,
+        prerelease: false,
+        assets: [],
+      };
+
+      const updateReleaseSpy = vi.fn(async () => ({ data: existingRelease }));
+      const getReleaseByTagSpy = vi.fn(async () => ({ data: existingRelease }));
+      const result = await release(
+        {
+          ...config,
+          input_tag_name: 'refs/tags/v1.0.0',
+        },
+        {
+          getReleaseByTag: getReleaseByTagSpy,
+          createRelease: () => Promise.reject('Not implemented'),
+          updateRelease: updateReleaseSpy,
+          finalizeRelease: () => Promise.reject('Not implemented'),
+          allReleases: async function* () {
+            yield { data: [existingRelease] };
+          },
+          listReleaseAssets: () => Promise.reject('Not implemented'),
+          deleteReleaseAsset: () => Promise.reject('Not implemented'),
+          deleteRelease: () => Promise.reject('Not implemented'),
+          updateReleaseAsset: () => Promise.reject('Not implemented'),
+          uploadReleaseAsset: () => Promise.reject('Not implemented'),
+        },
+        1,
+      );
+
+      expect(getReleaseByTagSpy).toHaveBeenCalledWith({
+        owner: 'owner',
+        repo: 'repo',
+        tag: 'v1.0.0',
+      });
+      expect(updateReleaseSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          tag_name: 'v1.0.0',
+        }),
+      );
+      assert.equal(result.release.id, existingRelease.id);
+      assert.equal(result.created, false);
+    });
+
+    it('reuses a canonical release after concurrent create success and removes empty duplicates', async () => {
+      const canonicalRelease: Release = {
+        id: 1,
+        upload_url: 'canonical-upload',
+        html_url: 'canonical-html',
+        tag_name: 'v1.0.0',
+        name: 'canonical',
+        body: 'test',
+        target_commitish: 'main',
+        draft: true,
+        prerelease: false,
+        assets: [],
+      };
+      const duplicateRelease: Release = {
+        id: 2,
+        upload_url: 'duplicate-upload',
+        html_url: 'duplicate-html',
+        tag_name: 'v1.0.0',
+        name: 'duplicate',
+        body: 'test',
+        target_commitish: 'main',
+        draft: true,
+        prerelease: false,
+        assets: [],
+      };
+
+      let lookupCount = 0;
+      const deleteReleaseSpy = vi.fn(async () => undefined);
+      const mockReleaser: Releaser = {
+        getReleaseByTag: () => {
+          lookupCount += 1;
+          if (lookupCount === 1) {
+            return Promise.reject({ status: 404 });
+          }
+          return Promise.resolve({ data: canonicalRelease });
+        },
+        createRelease: () => {
+          lookupCount += 1;
+          return Promise.resolve({ data: duplicateRelease });
+        },
+        updateRelease: () => Promise.reject('Not implemented'),
+        finalizeRelease: () => Promise.reject('Not implemented'),
+        allReleases: async function* () {
+          yield { data: lookupCount > 1 ? [duplicateRelease, canonicalRelease] : [] };
+        },
+        listReleaseAssets: () => Promise.reject('Not implemented'),
+        deleteReleaseAsset: () => Promise.reject('Not implemented'),
+        deleteRelease: deleteReleaseSpy,
+        updateReleaseAsset: () => Promise.reject('Not implemented'),
+        uploadReleaseAsset: () => Promise.reject('Not implemented'),
+      };
+
+      const result = await release(config, mockReleaser, 1);
+
+      assert.equal(result.release.id, canonicalRelease.id);
+      assert.equal(result.created, false);
+      expect(deleteReleaseSpy).toHaveBeenCalledWith({
+        owner: 'owner',
+        repo: 'repo',
+        release_id: duplicateRelease.id,
+      });
+    });
+
+    it('does not delete a pre-existing draft while canonicalizing its own create', async () => {
+      const createdRelease: Release = {
+        id: 1,
+        upload_url: 'created-upload',
+        html_url: 'created-html',
+        tag_name: 'v1.0.0',
+        name: 'created release',
+        body: 'created body',
+        target_commitish: 'main',
+        draft: true,
+        prerelease: false,
+        assets: [],
+      };
+      const manualDraft: Release = {
+        ...createdRelease,
+        id: 2,
+        name: 'manually authored draft',
+        body: 'notes that must not be deleted',
+      };
+      let created = false;
+      const deleteRelease = vi.fn().mockResolvedValue(undefined);
+      const releaser = createReleaser({
+        getReleaseByTag: vi.fn(() =>
+          created ? Promise.resolve({ data: createdRelease }) : Promise.reject({ status: 404 }),
+        ),
+        createRelease: vi.fn(async () => {
+          created = true;
+          return { data: createdRelease };
+        }),
+        allReleases: async function* () {
+          yield { data: created ? [createdRelease, manualDraft] : [] };
+        },
+        deleteRelease,
+      });
+
+      const result = await release(config, releaser, 1);
+
+      expect(result).toEqual({ release: createdRelease, created: true });
+      expect(deleteRelease).not.toHaveBeenCalled();
+    });
+
+    it('falls back to recent releases when tag lookup still lags after create', async () => {
+      const canonicalRelease: Release = {
+        id: 1,
+        upload_url: 'canonical-upload',
+        html_url: 'canonical-html',
+        tag_name: 'v1.0.0',
+        name: 'canonical',
+        body: 'test',
+        target_commitish: 'main',
+        draft: true,
+        prerelease: false,
+        assets: [],
+      };
+      const duplicateRelease: Release = {
+        id: 2,
+        upload_url: 'duplicate-upload',
+        html_url: 'duplicate-html',
+        tag_name: 'v1.0.0',
+        name: 'duplicate',
+        body: 'test',
+        target_commitish: 'main',
+        draft: true,
+        prerelease: false,
+        assets: [],
+      };
+
+      let created = false;
+      const deleteReleaseSpy = vi.fn(async () => undefined);
+      const mockReleaser: Releaser = {
+        getReleaseByTag: () => Promise.reject({ status: 404 }),
+        createRelease: () => {
+          created = true;
+          return Promise.resolve({ data: duplicateRelease });
+        },
+        updateRelease: () => Promise.reject('Not implemented'),
+        finalizeRelease: () => Promise.reject('Not implemented'),
+        allReleases: async function* () {
+          yield { data: created ? [duplicateRelease, canonicalRelease] : [] };
+        },
+        listReleaseAssets: () => Promise.reject('Not implemented'),
+        deleteReleaseAsset: () => Promise.reject('Not implemented'),
+        deleteRelease: deleteReleaseSpy,
+        updateReleaseAsset: () => Promise.reject('Not implemented'),
+        uploadReleaseAsset: () => Promise.reject('Not implemented'),
+      };
+
+      const result = await release(config, mockReleaser, 1);
+
+      assert.equal(result.release.id, canonicalRelease.id);
+      assert.equal(result.created, false);
+      expect(deleteReleaseSpy).toHaveBeenCalledWith({
+        owner: 'owner',
+        repo: 'repo',
+        release_id: duplicateRelease.id,
+      });
+    });
+
+    it.each([
+      ['gains assets', { assets: [{ id: 9, name: 'concurrent.zip' }] }],
+      ['is published', { draft: false }],
+    ])('does not delete its created release when it %s concurrently', async (_name, patch) => {
+      const canonicalRelease: Release = {
+        id: 1,
+        upload_url: 'canonical-upload',
+        html_url: 'canonical-html',
+        tag_name: 'v1.0.0',
+        name: 'canonical',
+        body: 'test',
+        target_commitish: 'main',
+        draft: true,
+        prerelease: false,
+        assets: [],
+      };
+      const createdRelease: Release = {
+        ...canonicalRelease,
+        id: 2,
+        name: 'created duplicate',
+      };
+      const refreshedCreatedRelease: Release = { ...createdRelease, ...patch };
+      const releaseByTag = refreshedCreatedRelease.draft
+        ? canonicalRelease
+        : refreshedCreatedRelease;
+      let created = false;
+      const deleteRelease = vi.fn().mockResolvedValue(undefined);
+      const releaser = createReleaser({
+        getReleaseByTag: vi.fn(() =>
+          created ? Promise.resolve({ data: releaseByTag }) : Promise.reject({ status: 404 }),
+        ),
+        createRelease: vi.fn(async () => {
+          created = true;
+          return { data: createdRelease };
+        }),
+        allReleases: async function* () {
+          yield {
+            data: created ? [refreshedCreatedRelease, canonicalRelease] : [],
+          };
+        },
+        deleteRelease,
+      });
+
+      const result = await release(config, releaser, 1);
+
+      expect(result).toEqual({
+        release: releaseByTag,
+        created: releaseByTag.id === createdRelease.id,
+      });
+      expect(deleteRelease).not.toHaveBeenCalled();
+    });
+
+    it('does not delete the just-created duplicate when refreshed state is unavailable', async () => {
+      const canonicalRelease: Release = {
+        id: 1,
+        upload_url: 'canonical-upload',
+        html_url: 'canonical-html',
+        tag_name: 'v1.0.0',
+        name: 'canonical',
+        body: 'test',
+        target_commitish: 'main',
+        draft: true,
+        prerelease: false,
+        assets: [],
+      };
+      const duplicateRelease: Release = {
+        id: 2,
+        upload_url: 'duplicate-upload',
+        html_url: 'duplicate-html',
+        tag_name: 'v1.0.0',
+        name: 'duplicate',
+        body: 'test',
+        target_commitish: 'main',
+        draft: true,
+        prerelease: false,
+        assets: [],
+      };
+
+      let lookupCount = 0;
+      const deleteReleaseSpy = vi.fn(async () => undefined);
+      const mockReleaser: Releaser = {
+        getReleaseByTag: () => {
+          lookupCount += 1;
+          if (lookupCount === 1) {
+            return Promise.reject({ status: 404 });
+          }
+          return Promise.resolve({ data: canonicalRelease });
+        },
+        createRelease: () => {
+          lookupCount += 1;
+          return Promise.resolve({ data: duplicateRelease });
+        },
+        updateRelease: () => Promise.reject('Not implemented'),
+        finalizeRelease: () => Promise.reject('Not implemented'),
+        allReleases: async function* () {
+          yield { data: lookupCount > 1 ? [canonicalRelease] : [] };
+        },
+        listReleaseAssets: () => Promise.reject('Not implemented'),
+        deleteReleaseAsset: () => Promise.reject('Not implemented'),
+        deleteRelease: deleteReleaseSpy,
+        updateReleaseAsset: () => Promise.reject('Not implemented'),
+        uploadReleaseAsset: () => Promise.reject('Not implemented'),
+      };
+
+      const result = await release(config, mockReleaser, 1);
+
+      assert.equal(result.release.id, canonicalRelease.id);
+      assert.equal(result.created, false);
+      expect(deleteReleaseSpy).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('upload', () => {
+    it('restores a dotfile label when GitHub normalizes the uploaded asset name', async () => {
+      const tempDir = mkdtempSync(join(tmpdir(), 'gh-release-dotfile-'));
+      const dotfilePath = join(tempDir, '.config');
+      writeFileSync(dotfilePath, 'config');
+
+      const updateReleaseAssetSpy = vi.fn(async () => ({
+        data: {
+          id: 1,
+          name: 'default.config',
+          label: '.config',
+        },
+      }));
+      const releaser: Releaser = {
+        getReleaseByTag: () => Promise.reject('Not implemented'),
+        createRelease: () => Promise.reject('Not implemented'),
+        updateRelease: () => Promise.reject('Not implemented'),
+        finalizeRelease: () => Promise.reject('Not implemented'),
+        allReleases: async function* () {
+          throw new Error('Not implemented');
+        },
+        listReleaseAssets: () => Promise.reject('Not implemented'),
+        deleteReleaseAsset: () => Promise.reject('Not implemented'),
+        deleteRelease: () => Promise.reject('Not implemented'),
+        updateReleaseAsset: updateReleaseAssetSpy,
+        uploadReleaseAsset: () =>
+          Promise.resolve({
+            status: 201,
+            data: {
+              id: 1,
+              name: 'default.config',
+              label: '',
+            },
+          }),
+      };
+
+      try {
+        const result = await upload(
+          config,
+          releaser,
+          'https://uploads.example.test/assets',
+          dotfilePath,
+          [],
+          1,
+        );
+
+        expect(updateReleaseAssetSpy).toHaveBeenCalledWith({
+          owner: 'owner',
+          repo: 'repo',
+          asset_id: 1,
+          name: 'default.config',
+          label: '.config',
+        });
+        expect(result).toEqual({
+          id: 1,
+          name: 'default.config',
+          label: '.config',
+        });
+      } finally {
+        rmSync(tempDir, { recursive: true, force: true });
+      }
+    });
+
+    it('refreshes release assets when the uploaded renamed asset is not immediately patchable', async () => {
+      const tempDir = mkdtempSync(join(tmpdir(), 'gh-release-dotfile-'));
+      const dotfilePath = join(tempDir, '.config');
+      writeFileSync(dotfilePath, 'config');
+
+      const updateReleaseAssetSpy = vi
+        .fn()
+        .mockRejectedValueOnce({ status: 404 })
+        .mockResolvedValueOnce({
+          data: {
+            id: 2,
+            name: 'default.config',
+            label: '.config',
+          },
+        });
+      const listReleaseAssetsSpy = vi.fn().mockResolvedValue([
+        {
+          id: 2,
+          name: 'default.config',
+          label: '',
+        },
+      ]);
+      const releaser: Releaser = {
+        getReleaseByTag: () => Promise.reject('Not implemented'),
+        createRelease: () => Promise.reject('Not implemented'),
+        updateRelease: () => Promise.reject('Not implemented'),
+        finalizeRelease: () => Promise.reject('Not implemented'),
+        allReleases: async function* () {
+          throw new Error('Not implemented');
+        },
+        listReleaseAssets: listReleaseAssetsSpy,
+        deleteReleaseAsset: () => Promise.reject('Not implemented'),
+        deleteRelease: () => Promise.reject('Not implemented'),
+        updateReleaseAsset: updateReleaseAssetSpy,
+        uploadReleaseAsset: () =>
+          Promise.resolve({
+            status: 201,
+            data: {
+              id: 1,
+              name: 'default.config',
+              label: '',
+            },
+          }),
+      };
+
+      try {
+        const result = await upload(
+          config,
+          releaser,
+          'https://uploads.github.com/repos/owner/repo/releases/1/assets',
+          dotfilePath,
+          [],
+          1,
+        );
+
+        expect(updateReleaseAssetSpy).toHaveBeenNthCalledWith(1, {
+          owner: 'owner',
+          repo: 'repo',
+          asset_id: 1,
+          name: 'default.config',
+          label: '.config',
+        });
+        expect(listReleaseAssetsSpy).toHaveBeenCalledWith({
+          owner: 'owner',
+          repo: 'repo',
+          release_id: 1,
+        });
+        expect(updateReleaseAssetSpy).toHaveBeenNthCalledWith(2, {
+          owner: 'owner',
+          repo: 'repo',
+          asset_id: 2,
+          name: 'default.config',
+          label: '.config',
+        });
+        expect(result).toEqual({
+          id: 2,
+          name: 'default.config',
+          label: '.config',
+        });
+      } finally {
+        rmSync(tempDir, { recursive: true, force: true });
+      }
+    });
+
+    it('treats update-a-release-asset 404 as success when a matching asset is present after refresh', async () => {
+      const tempDir = mkdtempSync(join(tmpdir(), 'gh-release-dotfile-'));
+      const dotfilePath = join(tempDir, '.config');
+      writeFileSync(dotfilePath, 'config');
+
+      const listReleaseAssetsSpy = vi.fn().mockResolvedValue([
+        {
+          id: 2,
+          name: 'default.config',
+          label: '.config',
+        },
+      ]);
+      const releaser: Releaser = {
+        getReleaseByTag: () => Promise.reject('Not implemented'),
+        createRelease: () => Promise.reject('Not implemented'),
+        updateRelease: () => Promise.reject('Not implemented'),
+        finalizeRelease: () => Promise.reject('Not implemented'),
+        allReleases: async function* () {
+          throw new Error('Not implemented');
+        },
+        listReleaseAssets: listReleaseAssetsSpy,
+        deleteReleaseAsset: () => Promise.reject('Not implemented'),
+        deleteRelease: () => Promise.reject('Not implemented'),
+        updateReleaseAsset: () => Promise.reject('Not implemented'),
+        uploadReleaseAsset: () =>
+          Promise.reject({
+            status: 404,
+            message:
+              'Not Found - https://docs.github.com/rest/releases/assets#update-a-release-asset',
+          }),
+      };
+
+      try {
+        const result = await upload(
+          config,
+          releaser,
+          'https://uploads.github.com/repos/owner/repo/releases/1/assets',
+          dotfilePath,
+          [],
+          1,
+        );
+
+        expect(listReleaseAssetsSpy).toHaveBeenCalledWith({
+          owner: 'owner',
+          repo: 'repo',
+          release_id: 1,
+        });
+        expect(result).toEqual({
+          id: 2,
+          name: 'default.config',
+          label: '.config',
+        });
+      } finally {
+        rmSync(tempDir, { recursive: true, force: true });
+      }
+    });
+
+    it('treats upload-endpoint 404s as release asset metadata failures when the docs link matches', async () => {
+      const tempDir = mkdtempSync(join(tmpdir(), 'gh-release-dotfile-'));
+      const dotfilePath = join(tempDir, '.config');
+      writeFileSync(dotfilePath, 'config');
+
+      const listReleaseAssetsSpy = vi.fn().mockResolvedValue([
+        {
+          id: 2,
+          name: 'default.config',
+          label: '.config',
+        },
+      ]);
+      const releaser: Releaser = {
+        getReleaseByTag: () => Promise.reject('Not implemented'),
+        createRelease: () => Promise.reject('Not implemented'),
+        updateRelease: () => Promise.reject('Not implemented'),
+        finalizeRelease: () => Promise.reject('Not implemented'),
+        allReleases: async function* () {
+          throw new Error('Not implemented');
+        },
+        listReleaseAssets: listReleaseAssetsSpy,
+        deleteReleaseAsset: () => Promise.reject('Not implemented'),
+        deleteRelease: () => Promise.reject('Not implemented'),
+        updateReleaseAsset: () => Promise.reject('Not implemented'),
+        uploadReleaseAsset: () =>
+          Promise.reject({
+            status: 404,
+            message:
+              'Not Found - https://docs.github.com/rest/releases/assets#update-a-release-asset',
+            request: {
+              url: 'https://uploads.github.com/repos/owner/repo/releases/1/assets?name=.config',
+            },
+          }),
+      };
+
+      try {
+        const result = await upload(
+          config,
+          releaser,
+          'https://uploads.github.com/repos/owner/repo/releases/1/assets',
+          dotfilePath,
+          [],
+          1,
+        );
+
+        expect(listReleaseAssetsSpy).toHaveBeenCalledWith({
+          owner: 'owner',
+          repo: 'repo',
+          release_id: 1,
+        });
+        expect(result).toEqual({
+          id: 2,
+          name: 'default.config',
+          label: '.config',
+        });
+      } finally {
+        rmSync(tempDir, { recursive: true, force: true });
+      }
+    });
+
+    it('polls for a matching asset after update-a-release-asset 404 before failing', async () => {
+      vi.useFakeTimers();
+      const tempDir = mkdtempSync(join(tmpdir(), 'gh-release-dotfile-'));
+      const dotfilePath = join(tempDir, '.config');
+      writeFileSync(dotfilePath, 'config');
+
+      const listReleaseAssetsSpy = vi
+        .fn()
+        .mockResolvedValueOnce([])
+        .mockResolvedValueOnce([
+          {
+            id: 2,
+            name: 'default.config',
+            label: '.config',
+          },
+        ]);
+      const releaser: Releaser = {
+        getReleaseByTag: () => Promise.reject('Not implemented'),
+        createRelease: () => Promise.reject('Not implemented'),
+        updateRelease: () => Promise.reject('Not implemented'),
+        finalizeRelease: () => Promise.reject('Not implemented'),
+        allReleases: async function* () {
+          throw new Error('Not implemented');
+        },
+        listReleaseAssets: listReleaseAssetsSpy,
+        deleteReleaseAsset: () => Promise.reject('Not implemented'),
+        deleteRelease: () => Promise.reject('Not implemented'),
+        updateReleaseAsset: () => Promise.reject('Not implemented'),
+        uploadReleaseAsset: () =>
+          Promise.reject({
+            status: 404,
+            message:
+              'Not Found - https://docs.github.com/rest/releases/assets#update-a-release-asset',
+          }),
+      };
+
+      try {
+        const resultPromise = upload(
+          config,
+          releaser,
+          'https://uploads.github.com/repos/owner/repo/releases/1/assets',
+          dotfilePath,
+          [],
+          1,
+        );
+
+        await vi.waitFor(() => expect(listReleaseAssetsSpy).toHaveBeenCalledTimes(1));
+        await vi.advanceTimersByTimeAsync(1000);
+
+        const result = await resultPromise;
+
+        expect(listReleaseAssetsSpy).toHaveBeenCalledTimes(2);
+        expect(result).toEqual({
+          id: 2,
+          name: 'default.config',
+          label: '.config',
+        });
+      } finally {
+        rmSync(tempDir, { recursive: true, force: true });
+      }
+    });
+
+    it('matches an existing asset by label when overwriting a dotfile', async () => {
+      const tempDir = mkdtempSync(join(tmpdir(), 'gh-release-dotfile-'));
+      const dotfilePath = join(tempDir, '.config');
+      writeFileSync(dotfilePath, 'config');
+
+      const deleteReleaseAssetSpy = vi.fn(async () => undefined);
+      const releaser: Releaser = {
+        getReleaseByTag: () => Promise.reject('Not implemented'),
+        createRelease: () => Promise.reject('Not implemented'),
+        updateRelease: () => Promise.reject('Not implemented'),
+        finalizeRelease: () => Promise.reject('Not implemented'),
+        allReleases: async function* () {
+          throw new Error('Not implemented');
+        },
+        listReleaseAssets: () => Promise.reject('Not implemented'),
+        deleteReleaseAsset: deleteReleaseAssetSpy,
+        deleteRelease: () => Promise.reject('Not implemented'),
+        updateReleaseAsset: () =>
+          Promise.resolve({
+            data: {
+              id: 2,
+              name: 'default.config',
+              label: '.config',
+            },
+          }),
+        uploadReleaseAsset: () =>
+          Promise.resolve({
+            status: 201,
+            data: {
+              id: 2,
+              name: 'default.config',
+              label: '',
+            },
+          }),
+      };
+
+      try {
+        await upload(
+          config,
+          releaser,
+          'https://uploads.example.test/assets',
+          dotfilePath,
+          [
+            {
+              id: 1,
+              name: 'default.config',
+              label: '.config',
+            },
+          ],
+          1,
+        );
+
+        expect(deleteReleaseAssetSpy).toHaveBeenCalledWith({
+          asset_id: 1,
+          owner: 'owner',
+          repo: 'repo',
+          release_id: 1,
+        });
+      } finally {
+        rmSync(tempDir, { recursive: true, force: true });
+      }
+    });
+  });
+});

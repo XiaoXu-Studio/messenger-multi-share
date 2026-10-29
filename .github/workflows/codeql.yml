@@ -1,33 +1,81 @@
-name: CodeQL
-
+name: Security checks
 on:
   push:
-    branches:
-      - main
+    branches: [main]
   pull_request:
-    branches:
-      - main
+    branches: [main]
+  workflow_call:
   schedule:
     - cron: '33 3 * * 1'
-
+permissions:
+  contents: read
 jobs:
-  analyze:
-    name: Analyze JavaScript
-    runs-on: ubuntu-latest
-    permissions:
-      security-events: write
-      packages: read
-      actions: read
-      contents: read
-
+  tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Initialize CodeQL
-        uses: github/codeql-action/init@v4
-        with:
-          languages: javascript-typescript
-
-      - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@v4
+      - name: Checkout exact commit without persisted credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_SHA" =~ ^[a-f0-9]{40}$ ]]
+          [[ "$GITHUB_REPOSITORY" == XiaoXu-Studio/messenger-multi-share ]]
+          [[ "$GITHUB_SERVER_URL" == https://github.com ]]
+          [[ ! -e .git && -z "$(ls -A .)" ]]
+          git init --initial-branch=bootstrap .
+          git remote add origin "https://github.com/$GITHUB_REPOSITORY.git"
+          GIT_TERMINAL_PROMPT=0 git -c credential.helper= -c core.hooksPath=/dev/null fetch --no-tags --depth=1 origin "$GITHUB_SHA"
+          git -c core.hooksPath=/dev/null checkout --detach "$GITHUB_SHA"
+          [[ "$(git rev-parse HEAD)" == "$GITHUB_SHA" ]]
+      - name: Install verified Node.js
+        run: sh scripts/setup-node.sh
+      - name: Verify application and maintained release tools
+        run: |
+          set -euo pipefail
+          npm ci --ignore-scripts --no-audit --no-fund
+          npm audit --audit-level=low
+          npm test
+          npm run build
+          (cd release-tools/attest && npm ci --ignore-scripts --no-audit --no-fund)
+          (cd release-tools/release && npm ci --ignore-scripts --no-audit --no-fund)
+          npm audit --prefix release-tools/attest --audit-level=low
+          npm audit --prefix release-tools/release --audit-level=low
+          node --test release-tools/security.test.cjs
+          (cd release-tools/attest && npm run lint && node node_modules/typescript/bin/tsc --noEmit && node --experimental-vm-modules node_modules/jest/bin/jest.js --runInBand)
+          (cd release-tools/release && npm run typecheck && npm test -- --run)
+          npm run package --prefix release-tools/attest
+          npm run build --prefix release-tools/release
+          node release-tools/verify.cjs
+  codeql:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout exact commit without persisted credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_SHA" =~ ^[a-f0-9]{40}$ ]]
+          [[ "$GITHUB_REPOSITORY" == XiaoXu-Studio/messenger-multi-share ]]
+          [[ "$GITHUB_SERVER_URL" == https://github.com ]]
+          [[ ! -e .git && -z "$(ls -A .)" ]]
+          git init --initial-branch=bootstrap .
+          git remote add origin "https://github.com/$GITHUB_REPOSITORY.git"
+          GIT_TERMINAL_PROMPT=0 git -c credential.helper= -c core.hooksPath=/dev/null fetch --no-tags --depth=1 origin "$GITHUB_SHA"
+          git -c core.hooksPath=/dev/null checkout --detach "$GITHUB_SHA"
+          [[ "$(git rev-parse HEAD)" == "$GITHUB_SHA" ]]
+      - name: Install verified Node.js
+        run: sh scripts/setup-node.sh
+      - name: Analyze JavaScript with verified CodeQL CLI
+        run: bash scripts/codeql-scan.sh
+      - name: Upload scan results
+        if: always() && env.CODEQL_SARIF != '' && github.ref_type != 'tag' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GH_TOKEN" | "$CODEQL_BIN" github upload-results --github-auth-stdin \
+            --repository="$GITHUB_REPOSITORY" --ref="$GITHUB_REF" --commit="$GITHUB_SHA" \
+            --sarif="$CODEQL_SARIF"

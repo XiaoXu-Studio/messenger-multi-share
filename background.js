@@ -5,6 +5,12 @@
  * WebRTC 流的等待交给 inject.js 的 getDisplayMedia 拦截处理
  */
 
+importScripts('security.js');
+const security = MMSecurity;
+let activeSession = null;
+let sourceReadyHandled = false;
+const signalCounts = new Map();
+
 // ---- 状态 ----
 let sourceTabId = null;
 const receiverTabs = new Set();
@@ -26,7 +32,29 @@ let lastStopAt = null;
 
 // ---- 消息处理 ----
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (!msg || typeof msg.type !== 'string' || sender.id !== chrome.runtime.id) return;
   const fromTabId = sender.tab?.id;
+  // The extension-owned popup may also be opened as its own tab for accessibility.
+  const popup = sender.url === chrome.runtime.getURL('popup.html');
+  const content = security.tabId(fromTabId) && sender.frameId === 0 && security.callUrl(sender.url);
+  const popupOnly = ['GET_DIAGNOSTICS', 'START_SHARING', 'UPDATE_SELECTION', 'REFRESH_TABS', 'TOGGLE_ALL_CAMERAS_FROM_POPUP'];
+  const contentOnly = ['TOGGLE_SHARING', 'SOURCE_READY', 'SOURCE_ENDED', 'RECEIVER_READY',
+    'RECEIVER_SHARE_CONSUMED', 'RECEIVER_SHARE_TIMEOUT', 'SIGNAL', 'CONNECTION_FAILED', 'TOGGLE_ALL_CAMERAS'];
+  if (popupOnly.includes(msg.type) ? !popup : contentOnly.includes(msg.type) ? !content : !popup && !content) return;
+  if (['START_SHARING', 'UPDATE_SELECTION'].includes(msg.type) && !security.tabIds(msg.tabIds)) return;
+  if (msg.type.startsWith('TOGGLE_ALL_CAMERAS') && typeof msg.enable !== 'boolean') return;
+  if (['SOURCE_READY', 'SOURCE_ENDED', 'RECEIVER_READY', 'RECEIVER_SHARE_CONSUMED',
+    'RECEIVER_SHARE_TIMEOUT', 'SIGNAL', 'CONNECTION_FAILED'].includes(msg.type)) {
+    if (!sharing || !activeSession || msg.session !== activeSession ||
+        (fromTabId !== sourceTabId && !receiverTabs.has(fromTabId))) return;
+    if (msg.type.startsWith('SOURCE_') && fromTabId !== sourceTabId) return;
+    if (msg.type.startsWith('RECEIVER_') && !receiverTabs.has(fromTabId)) return;
+  }
+  const respond = promise => {
+    Promise.resolve(promise).then(result => sendResponse(result ?? {ok:true}),
+      error => sendResponse({ok:false, error:security.text(error.message || '操作失败')}));
+    return true;
+  };
 
   switch (msg.type) {
     case 'GET_STATE':
@@ -34,19 +62,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return true;
 
     case 'GET_DIAGNOSTICS':
-      collectDiagnostics().then((diagnostics) => sendResponse(diagnostics));
-      return true;
+      return respond(collectDiagnostics());
 
     case 'START_SHARING':
-      startSharing(msg.tabIds).then(() => sendResponse({ ok: true }));
-      return true;
+      return respond(startSharing(msg.tabIds));
 
     case 'STOP_SHARING':
-      stopSharing().then(() => sendResponse({ ok: true }));
-      return true;
+      return respond(stopSharing());
 
     case 'UPDATE_SELECTION':
-      selectedTabIds = msg.tabIds || null;
+      selectedTabIds = [...msg.tabIds];
       log('弹窗勾选更新:', selectedTabIds);
       sendResponse({ ok: true });
       return true;
@@ -65,14 +90,19 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return true;
 
     case 'REFRESH_TABS':
-      refreshCallTabs().then((tabs) => sendResponse({ tabs }));
-      return true;
+      return respond(refreshCallTabs().then(tabs => ({tabs})));
 
-    case 'SOURCE_READY':
+    case 'SOURCE_READY': {
+      if (sourceReadyHandled) return;
+      sourceReadyHandled = true;
       log('源标签页已捕获屏幕，立即恢复源窗口');
       restoreWindow(sourceTabId);
-      handleSourceReady();
+      const readySession = activeSession;
+      handleSourceReady(readySession).catch(() => {
+        if (activeSession === readySession) return stopSharing();
+      });
       break;
+    }
 
     case 'SOURCE_ENDED':
       log('源流已结束, stopping=', stopping);
@@ -102,23 +132,27 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       break;
 
     case 'CONNECTION_FAILED':
+      if (!isSessionPair(fromTabId, msg.remoteTabId)) return;
       log(`连接失败: tab ${msg.remoteTabId}`);
       markTab(msg.remoteTabId, { error: 'connection failed', lastEvent: 'connection-failed' });
       break;
 
     // ---- 摄像头批量控制 ----
     case 'TOGGLE_ALL_CAMERAS':
-      toggleAllCameras(fromTabId, msg.enable).then(() => sendResponse({ ok: true }));
-      return true;
+      return respond(toggleAllCameras(fromTabId, msg.enable));
 
     case 'TOGGLE_ALL_CAMERAS_FROM_POPUP':
-      toggleAllCameras(null, msg.enable).then(() => sendResponse({ ok: true }));
-      return true;
+      return respond(toggleAllCameras(null, msg.enable));
   }
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   receiverTabs.delete(tabId);
+  tabDiagnostics.delete(tabId);
+  clearReceiverWaiter(receiverReadyWaiters, tabId);
+  clearReceiverWaiter(receiverConsumedWaiters, tabId);
+  receiverReadyState.delete(tabId);
+  receiverConsumedState.delete(tabId);
   if (tabId === sourceTabId) {
     log('源标签页已关闭');
     stopSharing();
@@ -141,19 +175,14 @@ async function toggleSharing(fromTabId) {
   if (callTabs.length < 1) return { ok: false, error: '没有检测到通话窗口', sharing: false };
 
   let tabIds;
-  if (selectedTabIds && selectedTabIds.length > 0) {
+  if (selectedTabIds !== null) {
     // 使用弹窗勾选的标签页（尊重用户选择）
     const validIds = selectedTabIds.filter((id) => callTabs.some((t) => t.id === id));
-    if (validIds.length > 0) {
+    if (validIds.length > 0 && validIds.includes(fromTabId)) {
       // 确保触发按钮的标签页在最前面（作为源）
-      if (validIds.includes(fromTabId)) {
-        tabIds = [fromTabId, ...validIds.filter((id) => id !== fromTabId)];
-      } else {
-        tabIds = [fromTabId, ...validIds.filter((id) => id !== fromTabId)];
-      }
+      tabIds = [fromTabId, ...validIds.filter((id) => id !== fromTabId)];
     } else {
-      // 勾选的标签页都失效了，回退到全部
-      tabIds = [fromTabId, ...callTabs.filter((t) => t.id !== fromTabId).map((t) => t.id)];
+      return {ok:false, sharing:false, error:'请在插件面板勾选当前通话和需要共享的通话；不会自动扩大共享范围。'};
     }
   } else {
     // 没有弹窗勾选记录，使用全部标签页
@@ -166,7 +195,24 @@ async function toggleSharing(fromTabId) {
 }
 
 async function startSharing(tabIds) {
-  if (!tabIds || tabIds.length < 1) return;
+  if (!security.tabIds(tabIds) || tabIds.length < 1) throw new Error('请选择有效的通话');
+  if (sharing || stopping) throw new Error('共享正在运行或停止，请稍后重试');
+  const session = crypto.randomUUID();
+  activeSession = session;
+  // Reserve immediately: another popup must not start a competing session while validating tabs.
+  sharing = true;
+  try {
+    const tabs = await Promise.all(tabIds.map(id => chrome.tabs.get(id)));
+    if (!tabs.every(tab => security.callUrl(tab.url))) throw new Error('目标已离开通话页面，请刷新列表');
+    if (activeSession !== session || stopping) throw new Error('共享已取消');
+  } catch (error) {
+    if (activeSession === session) { sharing = false; activeSession = null; }
+    throw error;
+  }
+  sourceReadyHandled = false;
+  signalCounts.clear();
+  receiverReadyState.clear();
+  receiverConsumedState.clear();
 
   sharing = true;
   lastStartAt = new Date().toISOString();
@@ -187,12 +233,15 @@ async function startSharing(tabIds) {
 
   // 确保所有标签页脚本已加载
   await ensureScripts(sourceTabId);
+  if (activeSession !== session) throw new Error('共享已取消');
   for (const tabId of receiverTabs) {
     await ensureScripts(tabId);
+    if (activeSession !== session) throw new Error('共享已取消');
   }
 
   // 放大源窗口到 1000x1000 并置顶
   await saveAndResize(sourceTabId, 1000, 1000);
+  if (activeSession !== session) { await restoreAllWindows(); throw new Error('共享已取消'); }
   try {
     const sourceTab = await chrome.tabs.get(sourceTabId);
     await chrome.windows.update(sourceTab.windowId, { focused: true });
@@ -202,14 +251,18 @@ async function startSharing(tabIds) {
   await sleep(500);
 
   // 设置角色
-  await safeSend(sourceTabId, { type: 'SET_ROLE', role: 'source' });
+  if (activeSession !== session) throw new Error('共享已取消');
+  await safeSend(sourceTabId, { type: 'SET_ROLE', role: 'source', session, peers: [...receiverTabs] });
   for (const tabId of receiverTabs) {
-    await safeSend(tabId, { type: 'SET_ROLE', role: 'receiver' });
+    if (activeSession !== session) throw new Error('共享已取消');
+    await safeSend(tabId, { type: 'SET_ROLE', role: 'receiver', session, peers: [sourceTabId] });
   }
   await sleep(200);
 
   // 点击源标签页的共享按钮（用户选择窗口后触发 SOURCE_READY）
-  await safeSend(sourceTabId, { type: 'CLICK_SHARE' });
+  if (activeSession !== session) throw new Error('共享已取消');
+  const clicked = await safeSend(sourceTabId, { type: 'CLICK_SHARE', session });
+  if (!clicked?.found) { await stopSharing(); throw new Error('未找到共享按钮；已取消共享'); }
   broadcastState();
 }
 
@@ -218,7 +271,8 @@ async function startSharing(tabIds) {
  * 关键改进：不再等 WebRTC 流，先发起连接，然后直接去点击按钮
  * inject.js 的 getDisplayMedia 拦截会自动等流到达
  */
-async function handleSourceReady() {
+async function handleSourceReady(session) {
+  if (!session || activeSession !== session || !sharing) return;
   if (receiverTabs.size === 0) {
     log('没有接收端，恢复窗口');
     await restoreAllWindows();
@@ -239,9 +293,11 @@ async function handleSourceReady() {
     // 1. 同时发起所有 WebRTC 连接（不等待）
     log('发起所有 WebRTC 连接...');
     for (const receiverTabId of receivers) {
+      if (activeSession !== session || !sharing) return;
       log(`send create_offer: source ${sourceTabId} -> receiver ${receiverTabId}`);
       safeSend(sourceTabId, {
         type: 'CREATE_OFFER',
+        session,
         targetTabId: receiverTabId,
       });
     }
@@ -251,12 +307,16 @@ async function handleSourceReady() {
 
     // 2. 逐个处理接收端：拉宽 → 点击 → 立即缩回
     for (let i = 0; i < receivers.length; i++) {
+      if (activeSession !== session || !sharing) return;
       const receiverTabId = receivers[i];
+      if (!receiverTabs.has(receiverTabId)) continue;
       log(`--- 处理接收端 ${i + 1}/${receivers.length}: tab ${receiverTabId} ---`);
 
       try {
         log(`wait receiver ready start: tab ${receiverTabId}`);
-        await waitForReceiverReady(receiverTabId, 12000);
+        const ready = await waitForReceiverReady(receiverTabId, 12000);
+        if (activeSession !== session || !sharing) return;
+        if (!ready || !receiverTabs.has(receiverTabId)) continue;
         log(`wait receiver ready done: tab ${receiverTabId}`);
         // 拉宽窗口到 800（高度不变）
         await saveAndResize(receiverTabId, 800, null);
@@ -264,7 +324,8 @@ async function handleSourceReady() {
 
         // 点击共享按钮
         log(`click share request: tab ${receiverTabId}`);
-        const result = await safeSend(receiverTabId, { type: 'CLICK_SHARE' });
+        if (activeSession !== session || !sharing) return;
+        const result = await safeSend(receiverTabId, { type: 'CLICK_SHARE', session });
         markTab(receiverTabId, {
           shareButtonFound: !!result?.found,
           lastEvent: result?.found ? 'click-share-found' : 'click-share-not-found',
@@ -383,8 +444,22 @@ async function restoreAllWindows() {
   savedWindowSizes.clear();
 }
 
+function isSessionPair(fromTabId, targetTabId) {
+  return sharing && security.tabId(targetTabId) && fromTabId !== targetTabId &&
+    ((fromTabId === sourceTabId && receiverTabs.has(targetTabId)) ||
+     (targetTabId === sourceTabId && receiverTabs.has(fromTabId)));
+}
+
 function relaySignal(fromTabId, targetTabId, signal) {
-  safeSend(targetTabId, { type: 'SIGNAL', fromTabId, signal });
+  const clean = security.signal(signal);
+  if (!isSessionPair(fromTabId, targetTabId) || !clean) return;
+  if (clean.type === 'offer' && fromTabId !== sourceTabId) return;
+  if (clean.type === 'answer' && targetTabId !== sourceTabId) return;
+  const key = `${fromTabId}:${targetTabId}`;
+  const count = (signalCounts.get(key) || 0) + 1;
+  if (count > 512) return;
+  signalCounts.set(key, count);
+  safeSend(targetTabId, { type: 'SIGNAL', fromTabId, signal: clean, session: activeSession });
 }
 
 async function stopSharing() {
@@ -394,6 +469,9 @@ async function stopSharing() {
   }
   stopping = true;
   sharing = false;
+  activeSession = null;
+  sourceReadyHandled = false;
+  signalCounts.clear();
   lastStopAt = new Date().toISOString();
 
   const trackedTabs = [sourceTabId, ...receiverTabs].filter(Boolean);
@@ -435,7 +513,7 @@ async function refreshCallTabs() {
     url: ['https://www.messenger.com/*', 'https://www.facebook.com/*'],
   });
   return tabs
-    .filter((t) => /groupcall/i.test(t.url))
+    .filter((t) => security.callUrl(t.url))
     .map((tab) => ({ id: tab.id, title: tab.title, url: tab.url, inCall: true }));
 }
 
@@ -450,7 +528,7 @@ async function ensureScripts(tabId) {
   log(`tab ${tabId} 需要注入脚本`);
   try {
     await chrome.scripting.executeScript({ target: { tabId }, files: ['inject.js'], world: 'MAIN' });
-    await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] });
+    await chrome.scripting.executeScript({ target: { tabId }, files: ['security.js', 'content.js'] });
     log(`已注入脚本到 tab ${tabId}`);
     markTab(tabId, { injected: true, lastEvent: 'script-injected', error: null });
   } catch (e) {
@@ -501,7 +579,11 @@ async function broadcastState() {
 
 async function safeSend(tabId, msg) {
   try {
-    return await chrome.tabs.sendMessage(tabId, msg);
+    if (!security.tabId(tabId)) return null;
+    const tab = await chrome.tabs.get(tabId);
+    if (!security.callUrl(tab.url)) return null;
+    if (msg.session && msg.session !== activeSession) return null;
+    return await chrome.tabs.sendMessage(tabId, msg, {frameId: 0});
   } catch (e) {
     log(`发送消息到 tab ${tabId} 失败:`, e.message);
     markTab(tabId, { error: e.message, lastEvent: `send-${msg?.type || 'message'}-failed` });
@@ -587,6 +669,7 @@ function clearReceiverWaiter(store, tabId) {
   log(`clear receiver ${phase} waiter: tab ${tabId}`);
   clearTimeout(waiter.timeoutId);
   store.delete(tabId);
+  waiter.resolve(false);
 }
 
 function sleep(ms) {
@@ -600,7 +683,7 @@ async function toggleAllCameras(senderTabId, enable) {
     url: ['https://www.messenger.com/*', 'https://www.facebook.com/*'],
   });
   const callTabs = tabs.filter(
-    (t) => t.url && /groupcall|\/call\//i.test(t.url) && t.id !== senderTabId
+    (t) => security.callUrl(t.url, true) && t.id !== senderTabId
   );
   log(`批量${enable ? '开启' : '关闭'}摄像头: ${callTabs.length} 个标签页`);
 
@@ -661,13 +744,14 @@ function log(...args) {
   };
   eventLog.push(entry);
   if (eventLog.length > LOG_LIMIT) eventLog.shift();
-  console.log('[MMS-bg]', ...args);
+  console.log('[MMS-bg]', ...entry.args);
 }
 
 function markTab(tabId, patch) {
   if (!tabId) return;
   const prev = tabDiagnostics.get(tabId) || {};
   tabDiagnostics.set(tabId, { ...prev, ...patch, tabId, updatedAt: new Date().toISOString() });
+  if (tabDiagnostics.size > 128) tabDiagnostics.delete(tabDiagnostics.keys().next().value);
 }
 
 async function collectDiagnostics() {
@@ -678,7 +762,6 @@ async function collectDiagnostics() {
     const prev = tabDiagnostics.get(tab.id) || {};
     const injected = !!ping?.ok;
     markTab(tab.id, {
-      title: tab.title,
       injected,
       inCall: true,
       lastEvent: injected ? (prev.lastEvent || 'diagnostic-ping-ok') : 'diagnostic-ping-failed',
@@ -686,13 +769,12 @@ async function collectDiagnostics() {
     const next = tabDiagnostics.get(tab.id) || {};
     tabRows.push({
       tabId: tab.id,
-      title: tab.title || '(通话)',
       role: next.role || (tab.id === sourceTabId ? 'source' : receiverTabs.has(tab.id) ? 'receiver' : 'idle'),
       injected: next.injected === true,
       shareButtonFound: next.shareButtonFound,
       streamReady: next.streamReady === true,
       consumed: next.consumed === true,
-      error: next.error || '',
+      error: sanitizeText(next.error || ''),
       lastEvent: next.lastEvent || '',
       updatedAt: next.updatedAt || '',
     });
@@ -720,12 +802,10 @@ function formatLogArg(arg) {
   try {
     return sanitizeText(JSON.stringify(arg));
   } catch {
-    return String(arg);
+    return sanitizeText(String(arg));
   }
 }
 
 function sanitizeText(text) {
-  return String(text)
-    .replace(/https?:\/\/[^\s"'<>]+/gi, '[url]')
-    .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, '[email]');
+  return security.text(text);
 }

@@ -1,252 +1,183 @@
 /**
- * inject.js - 运行在 MAIN world（页面上下文）
- * 功能：拦截 getDisplayMedia，管理 WebRTC 流中继
+ * MAIN-world media adapter. The hosting page already receives the user-approved stream.
+ * Page messages are untrusted; privileged cross-tab authorization lives in background.js.
  */
 (function () {
   'use strict';
-
+  if (!navigator.mediaDevices?.getDisplayMedia || globalThis.__mmsMediaInstalled) return;
+  Object.defineProperty(globalThis, '__mmsMediaInstalled', {value:true});
+  const nativeCapture = navigator.mediaDevices.getDisplayMedia.bind(navigator.mediaDevices);
   const PREFIX = 'MMS_';
-  const log = (...args) => console.log('[MMS-inject]', ...args);
+  let role = null, session = null, generation = 0;
+  let peers = new Set();
+  let capturedStream = null, receivedStream = null;
+  const deliveredStreams = new Set(), peerConnections = new Map(), iceCandidateBuffers = new Map();
+  const abort = () => new DOMException('共享已取消或过期', 'AbortError');
+  const live = (s, g) => !!s && s === session && g === generation;
+  const log = () => {}; // No SDP, ICE addresses, call URLs or page data in console logs.
 
-  // ---- 状态 ----
-  let role = null;            // 'source' | 'receiver' | null
-  let capturedStream = null;  // 源标签页捕获的 MediaStream
-  let receivedStream = null;  // 接收标签页通过 WebRTC 收到的 MediaStream
-  const deliveredStreams = new Set();
-  const peerConnections = new Map(); // remoteTabId -> RTCPeerConnection
-  const iceCandidateBuffers = new Map(); // remoteTabId -> candidates[]
-
-  // ---- 保存原始 API ----
-  const _getDisplayMedia = navigator.mediaDevices.getDisplayMedia.bind(
-    navigator.mediaDevices
-  );
-
-  // ---- 重写 getDisplayMedia ----
-  navigator.mediaDevices.getDisplayMedia = async function (constraints) {
-    // 接收端：返回 WebRTC 收到的流（如果流还没到，等最多 15 秒）
-    if (role === 'receiver') {
-      if (!receivedStream || !receivedStream.active) {
-        log('接收端：WebRTC 流尚未到达，等待中...');
-        await new Promise((resolve) => {
-          let elapsed = 0;
-          const interval = setInterval(() => {
-            elapsed += 200;
-            if ((receivedStream && receivedStream.active) || elapsed >= 15000) {
-              clearInterval(interval);
-              resolve();
-            }
-          }, 200);
-        });
-      }
-
-      if (receivedStream && receivedStream.active) {
-        log('接收端：✅ 返回 WebRTC 流，跳过选择弹窗');
-        // 直接返回原始流（不 clone），这样 STOP_SHARING 停止 track 后 Messenger 能立即感知
-        log('receiver share consumed, tracks=', receivedStream.getTracks().map((t) => `${t.kind}:${t.readyState}`));
-        post('RECEIVER_SHARE_CONSUMED');
-        return makeDeliveredClone(receivedStream);
-      }
-
-      log('接收端：❌ WebRTC 流超时，调用原始 API');
-      log('receiver share timeout, role=', role);
-      post('RECEIVER_SHARE_TIMEOUT');
-      return _getDisplayMedia(constraints);
-    }
-
-    // 源端：正常弹窗选择，然后缓存流
-    if (role === 'source') {
-      log('源端：弹窗选择共享窗口');
-      const stream = await _getDisplayMedia(constraints);
-      log('source getDisplayMedia resolved, tracks=', stream.getTracks().map((t) => `${t.kind}:${t.readyState}`));
-      capturedStream = stream;
-
-      // 监听流结束（仅当 role 仍为 source 时才通知，防止手动 STOP_SHARING 后的延迟事件）
-      stream.getVideoTracks().forEach((track) => {
-        track.addEventListener('ended', () => {
-          if (role !== 'source') {
-            log('源流 ended 事件到达，但 role 已非 source，忽略');
-            return;
-          }
-          log('源流已自然结束');
-          post('SOURCE_STREAM_ENDED');
-        });
-      });
-
-      post('SOURCE_STREAM_READY');
-      post('SOURCE_SHARE_CONSUMED');
-      return makeDeliveredClone(stream);
-    }
-
-    // 未激活状态：正常调用
-    return _getDisplayMedia(constraints);
-  };
-
-  // ---- WebRTC ----
-  function createPC(remoteTabId) {
-    const pc = new RTCPeerConnection({
-      iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
-    });
-    peerConnections.set(remoteTabId, pc);
-    iceCandidateBuffers.set(remoteTabId, []);
-
-    pc.onicecandidate = (e) => {
-      if (e.candidate) {
-        post('SIGNAL_OUT', {
-          targetTabId: remoteTabId,
-          signal: { type: 'candidate', candidate: e.candidate.toJSON() },
-        });
-      }
-    };
-
-    pc.ontrack = (e) => {
-      log('收到远端视频轨道');
-      receivedStream = e.streams[0] || new MediaStream([e.track]);
-      log('receiver ontrack assigned stream, remoteTabId=', remoteTabId, 'tracks=', receivedStream.getTracks().map((t) => `${t.kind}:${t.readyState}`));
-      post('RECEIVER_STREAM_READY');
-    };
-
-    pc.onconnectionstatechange = () => {
-      log(`与 tab ${remoteTabId} 连接状态: ${pc.connectionState}`);
-      if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
-        post('CONNECTION_FAILED', { remoteTabId });
-        // 接收端：源断开后主动停止流，让 Messenger 感知到共享结束
-        if (role === 'receiver' && receivedStream) {
-          log('接收端：源连接断开，主动停止接收流');
-          receivedStream.getTracks().forEach((t) => t.stop());
-        }
-      }
-    };
-
-    return pc;
+  function stopStream(stream) { stream?.getTracks().forEach(track => track.stop()); }
+  function cleanup() {
+    generation++;
+    role = null; session = null; peers.clear();
+    stopStream(capturedStream); stopStream(receivedStream);
+    for (const stream of deliveredStreams) stopStream(stream);
+    deliveredStreams.clear();
+    peerConnections.forEach(pc => pc.close());
+    peerConnections.clear(); iceCandidateBuffers.clear();
+    capturedStream = receivedStream = null;
   }
-
-  async function flushIceCandidates(remoteTabId) {
-    const pc = peerConnections.get(remoteTabId);
-    const buf = iceCandidateBuffers.get(remoteTabId);
-    if (!pc || !buf) return;
-    for (const c of buf) {
-      await pc.addIceCandidate(new RTCIceCandidate(c));
-    }
-    iceCandidateBuffers.set(remoteTabId, []);
+  function post(type, data) {
+    window.postMessage({type:PREFIX + type, direction:'from-page', session, data}, location.origin);
   }
-
-  // ---- 消息处理 ----
-  window.addEventListener('message', async (e) => {
-    if (e.source !== window || !e.data?.type?.startsWith(PREFIX)) return;
-    const type = e.data.type.slice(PREFIX.length);
-    const data = e.data.data || {};
-
-    switch (type) {
-      case 'SET_ROLE':
-        role = data.role;
-        log('角色设置为:', role);
-        break;
-
-      case 'CREATE_OFFER': {
-        const { targetTabId } = data;
-        log(`创建 offer → tab ${targetTabId}`);
-        const pc = createPC(targetTabId);
-        if (capturedStream) {
-          capturedStream.getTracks().forEach((t) => pc.addTrack(t, capturedStream));
-        } else {
-          log('⚠️ capturedStream 为空！');
-        }
-        const offer = await pc.createOffer();
-        await pc.setLocalDescription(offer);
-        post('SIGNAL_OUT', {
-          targetTabId,
-          signal: { type: 'offer', sdp: pc.localDescription.sdp },
-        });
-        break;
-      }
-
-      case 'HANDLE_SIGNAL': {
-        const { fromTabId, signal } = data;
-
-        if (signal.type === 'offer') {
-          log(`收到 offer ← tab ${fromTabId}`);
-          const pc = createPC(fromTabId);
-          await pc.setRemoteDescription(new RTCSessionDescription({ type: 'offer', sdp: signal.sdp }));
-          await flushIceCandidates(fromTabId);
-          const answer = await pc.createAnswer();
-          await pc.setLocalDescription(answer);
-          post('SIGNAL_OUT', {
-            targetTabId: fromTabId,
-            signal: { type: 'answer', sdp: pc.localDescription.sdp },
-          });
-        } else if (signal.type === 'answer') {
-          log(`收到 answer ← tab ${fromTabId}`);
-          const pc = peerConnections.get(fromTabId);
-          if (pc) {
-            await pc.setRemoteDescription(new RTCSessionDescription({ type: 'answer', sdp: signal.sdp }));
-            await flushIceCandidates(fromTabId);
-          }
-        } else if (signal.type === 'candidate') {
-          const pc = peerConnections.get(fromTabId);
-          if (pc && pc.remoteDescription) {
-            await pc.addIceCandidate(new RTCIceCandidate(signal.candidate));
-          } else {
-            const buf = iceCandidateBuffers.get(fromTabId) || [];
-            buf.push(signal.candidate);
-            iceCandidateBuffers.set(fromTabId, buf);
-          }
-        }
-        break;
-      }
-
-      case 'STOP_SHARING': {
-        // 停止所有 stream tracks，Messenger 会自动检测到流结束并停止共享
-        if (capturedStream) {
-          capturedStream.getTracks().forEach((t) => { log('停止源 track:', t.kind); t.stop(); });
-        }
-        if (receivedStream) {
-          receivedStream.getTracks().forEach((t) => { log('停止接收 track:', t.kind); t.stop(); });
-        }
-        stopDeliveredStreams();
-        peerConnections.forEach((pc) => pc.close());
-        peerConnections.clear();
-        iceCandidateBuffers.clear();
-        capturedStream = null;
-        receivedStream = null;
-        role = null;
-        log('已清理，所有流和 WebRTC 连接已关闭');
-        break;
-      }
-    }
-  });
-
-  // ---- 工具函数 ----
-  function makeDeliveredClone(stream) {
+  function delivered(stream) {
     const clone = stream.clone();
     deliveredStreams.add(clone);
-    clone.addEventListener('inactive', () => deliveredStreams.delete(clone), { once: true });
-    clone.getTracks().forEach((track) => {
-      track.addEventListener('ended', () => {
-        if (clone.getTracks().every((t) => t.readyState === 'ended')) {
-          deliveredStreams.delete(clone);
-        }
-      }, { once: true });
-    });
+    clone.addEventListener('inactive', () => deliveredStreams.delete(clone), {once:true});
     return clone;
   }
-
-  function stopDeliveredStreams() {
-    deliveredStreams.forEach((stream) => {
-      try {
-        stream.getTracks().forEach((t) => {
-          log('stop delivered track:', t.kind);
-          t.stop();
-        });
-      } catch (e) {
-        log('stop delivered stream failed:', e.message);
+  navigator.mediaDevices.getDisplayMedia = async function (constraints) {
+    const s = session, g = generation, r = role;
+    if (!s || !r) return nativeCapture(constraints);
+    if (r === 'receiver') {
+      if (!receivedStream?.active) await new Promise((resolve, reject) => {
+        let elapsed = 0;
+        const timer = setInterval(() => {
+          elapsed += 200;
+          if (!live(s, g)) { clearInterval(timer); reject(abort()); }
+          else if (receivedStream?.active || elapsed >= 15000) { clearInterval(timer); resolve(); }
+        }, 200);
+      });
+      if (!live(s, g)) throw abort();
+      if (receivedStream?.active) {
+        post('RECEIVER_SHARE_CONSUMED');
+        return delivered(receivedStream);
       }
-    });
-    deliveredStreams.clear();
-  }
+      post('RECEIVER_SHARE_TIMEOUT');
+      // Preserve the explicit native picker fallback, never select a source automatically.
+      const stream = await nativeCapture(constraints);
+      if (!live(s, g)) { stopStream(stream); throw abort(); }
+      capturedStream = stream;
+      return delivered(stream);
+    }
+    try {
+      const stream = await nativeCapture(constraints);
+      if (!live(s, g)) { stopStream(stream); throw abort(); }
+      stopStream(capturedStream);
+      capturedStream = stream;
+      stream.getVideoTracks().forEach(track => track.addEventListener('ended', () => {
+        if (live(s, g)) { post('SOURCE_STREAM_ENDED'); cleanup(); }
+      }, {once:true}));
+      post('SOURCE_STREAM_READY');
+      post('SOURCE_SHARE_CONSUMED');
+      return delivered(stream);
+    } catch (error) {
+      if (live(s, g)) post('SOURCE_STREAM_ENDED');
+      throw error;
+    }
+  };
 
-  function post(type, data) {
-    window.postMessage({ type: PREFIX + type, data }, '*');
+  function createPC(remoteTabId) {
+    if (!peers.has(remoteTabId)) throw new Error('Peer not authorized');
+    peerConnections.get(remoteTabId)?.close();
+    const s = session, g = generation;
+    // Existing STUN service retained for connectivity; disclosed in README.
+    const pc = new RTCPeerConnection({iceServers:[{urls:'stun:stun.l.google.com:19302'}]});
+    peerConnections.set(remoteTabId, pc);
+    if (!iceCandidateBuffers.has(remoteTabId)) iceCandidateBuffers.set(remoteTabId, []);
+    pc.onicecandidate = event => {
+      if (live(s, g) && event.candidate) post('SIGNAL_OUT', {
+        targetTabId:remoteTabId, signal:{type:'candidate', candidate:event.candidate.toJSON()}
+      });
+    };
+    pc.ontrack = event => {
+      if (!live(s, g) || role !== 'receiver') { event.track.stop(); return; }
+      receivedStream = event.streams[0] || new MediaStream([event.track]);
+      post('RECEIVER_STREAM_READY');
+    };
+    pc.onconnectionstatechange = () => {
+      if (!live(s, g)) return;
+      if (['failed', 'disconnected'].includes(pc.connectionState)) {
+        post('CONNECTION_FAILED', {remoteTabId});
+        if (role === 'receiver') {
+          stopStream(receivedStream);
+          for (const stream of deliveredStreams) stopStream(stream);
+          deliveredStreams.clear();
+        }
+      }
+    };
+    return pc;
   }
-
-  log('已加载');
+  async function flush(remoteTabId, s, g) {
+    const pc = peerConnections.get(remoteTabId);
+    const candidates = iceCandidateBuffers.get(remoteTabId) || [];
+    iceCandidateBuffers.set(remoteTabId, []);
+    for (const candidate of candidates) {
+      if (!live(s, g)) return;
+      await pc.addIceCandidate(new RTCIceCandidate(candidate));
+    }
+  }
+  async function command(message) {
+    const data = message.data || {};
+    if (message.type === PREFIX + 'SET_ROLE') {
+      if (!['source','receiver'].includes(data.role) || typeof message.session !== 'string' ||
+          !message.session || message.session.length > 64 || !Array.isArray(data.peers) ||
+          data.peers.length > 128 || !data.peers.every(id => Number.isSafeInteger(id) && id >= 0)) return;
+      cleanup();
+      session = message.session; role = data.role; peers = new Set(data.peers);
+      return;
+    }
+    if (message.type === PREFIX + 'STOP_SHARING') {
+      if (session && message.session === session) cleanup();
+      return;
+    }
+    const s = session, g = generation;
+    if (!s || message.session !== s) return;
+    if (message.type === PREFIX + 'CREATE_OFFER') {
+      if (role !== 'source' || !peers.has(data.targetTabId) || !capturedStream?.active) return;
+      const pc = createPC(data.targetTabId);
+      capturedStream.getTracks().forEach(track => pc.addTrack(track, capturedStream));
+      const offer = await pc.createOffer();
+      if (!live(s, g)) { pc.close(); return; }
+      await pc.setLocalDescription(offer);
+      if (live(s, g)) post('SIGNAL_OUT', {targetTabId:data.targetTabId, signal:{type:'offer',sdp:pc.localDescription.sdp}});
+      return;
+    }
+    if (message.type !== PREFIX + 'HANDLE_SIGNAL' || !peers.has(data.fromTabId)) return;
+    const {fromTabId, signal} = data;
+    if (!signal || typeof signal !== 'object') return;
+    if (signal.type === 'offer' || signal.type === 'answer') {
+      if (typeof signal.sdp !== 'string' || signal.sdp.length > 131072) return;
+      if (signal.type === 'offer') {
+        if (role !== 'receiver') return;
+        const pc = createPC(fromTabId);
+        await pc.setRemoteDescription({type:'offer',sdp:signal.sdp});
+        if (!live(s, g)) { pc.close(); return; }
+        await flush(fromTabId,s,g);
+        const answer = await pc.createAnswer();
+        if (!live(s,g)) { pc.close(); return; }
+        await pc.setLocalDescription(answer);
+        if (live(s,g)) post('SIGNAL_OUT',{targetTabId:fromTabId,signal:{type:'answer',sdp:pc.localDescription.sdp}});
+      } else if (role === 'source') {
+        const pc = peerConnections.get(fromTabId);
+        if (!pc) return;
+        await pc.setRemoteDescription({type:'answer',sdp:signal.sdp});
+        if (live(s,g)) await flush(fromTabId,s,g);
+      }
+    } else if (signal.type === 'candidate' && signal.candidate &&
+               typeof signal.candidate.candidate === 'string' && signal.candidate.candidate.length <= 8192) {
+      const pc = peerConnections.get(fromTabId);
+      if (pc?.remoteDescription) await pc.addIceCandidate(new RTCIceCandidate(signal.candidate));
+      else {
+        const buffer = iceCandidateBuffers.get(fromTabId) || [];
+        if (buffer.length >= 256) return;
+        buffer.push(signal.candidate); iceCandidateBuffers.set(fromTabId,buffer);
+      }
+    }
+  }
+  window.addEventListener('message', event => {
+    if (event.source !== window || event.origin !== location.origin || event.data?.direction !== 'to-page' ||
+        typeof event.data?.type !== 'string' || !event.data.type.startsWith(PREFIX)) return;
+    command(event.data).catch(log);
+  });
 })();

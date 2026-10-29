@@ -4,9 +4,16 @@
  */
 (function () {
   'use strict';
+  if (globalThis.__mmsContentInstalled) return;
+  Object.defineProperty(globalThis, '__mmsContentInstalled', {value: true});
+  const security = MMSecurity;
+  let activeSession = null;
+  let currentRole = null;
+  let peers = new Set();
+  let commandGeneration = 0;
 
   const PREFIX = 'MMS_';
-  const log = (...args) => console.log('[MMS-content]', ...args);
+  const log = (...args) => console.log('[MMS-content]', ...args.map(security.text));
   let lastShareButton = null;
 
   // ---- 消息桥梁：inject.js -> background.js ----
@@ -15,50 +22,65 @@
   }
 
   window.addEventListener('message', (e) => {
-    if (e.source !== window || !e.data?.type?.startsWith(PREFIX)) return;
+    if (e.source !== window || e.origin !== location.origin || e.data?.direction !== 'from-page' ||
+        typeof e.data?.type !== 'string' || !e.data.type.startsWith(PREFIX) ||
+        !activeSession || e.data.session !== activeSession) return;
     const type = e.data.type.slice(PREFIX.length);
     const data = e.data.data || {};
 
     switch (type) {
       case 'SOURCE_STREAM_READY':
-        safeSendBg({ type: 'SOURCE_READY' });
+        if (currentRole === 'source') safeSendBg({ type: 'SOURCE_READY', session: activeSession });
         break;
       case 'SOURCE_STREAM_ENDED':
-        safeSendBg({ type: 'SOURCE_ENDED' });
+        if (currentRole === 'source') safeSendBg({ type: 'SOURCE_ENDED', session: activeSession });
         break;
       case 'RECEIVER_STREAM_READY':
-        safeSendBg({ type: 'RECEIVER_READY' });
+        if (currentRole === 'receiver') safeSendBg({ type: 'RECEIVER_READY', session: activeSession });
         break;
       case 'RECEIVER_SHARE_CONSUMED':
-        safeSendBg({ type: 'RECEIVER_SHARE_CONSUMED' });
+        if (currentRole === 'receiver') safeSendBg({ type: 'RECEIVER_SHARE_CONSUMED', session: activeSession });
         break;
       case 'RECEIVER_SHARE_TIMEOUT':
-        safeSendBg({ type: 'RECEIVER_SHARE_TIMEOUT' });
+        if (currentRole === 'receiver') safeSendBg({ type: 'RECEIVER_SHARE_TIMEOUT', session: activeSession });
         break;
       case 'SOURCE_SHARE_CONSUMED':
-        safeSendBg({ type: 'SOURCE_SHARE_CONSUMED' });
         break;
       case 'SIGNAL_OUT':
-        safeSendBg({ type: 'SIGNAL', targetTabId: data.targetTabId, signal: data.signal });
+        if (peers.has(data.targetTabId)) {
+          const signal = security.signal(data.signal);
+          if (signal) safeSendBg({type:'SIGNAL', targetTabId:data.targetTabId, signal, session:activeSession});
+        }
         break;
       case 'CONNECTION_FAILED':
-        safeSendBg({ type: 'CONNECTION_FAILED', remoteTabId: data.remoteTabId });
+        if (peers.has(data.remoteTabId)) safeSendBg({ type: 'CONNECTION_FAILED', remoteTabId: data.remoteTabId, session:activeSession });
         break;
     }
   });
 
   // ---- background.js -> inject.js / DOM 操作 ----
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+    if (sender.id !== chrome.runtime.id || sender.tab || !msg || typeof msg.type !== 'string') return;
+    if (['CREATE_OFFER', 'SIGNAL', 'CLICK_SHARE'].includes(msg.type) &&
+        (!activeSession || msg.session !== activeSession)) return;
     switch (msg.type) {
       case 'SET_ROLE':
-        toInject('SET_ROLE', { role: msg.role });
+        if (!['source', 'receiver'].includes(msg.role) || typeof msg.session !== 'string' ||
+            !msg.session || msg.session.length > 64 || !security.tabIds(msg.peers)) return;
+        commandGeneration++;
+        activeSession = msg.session;
+        currentRole = msg.role;
+        peers = new Set(msg.peers);
+        toInject('SET_ROLE', { role: msg.role, peers: msg.peers });
         sendResponse({ ok: true });
         break;
       case 'CREATE_OFFER':
+        if (currentRole !== 'source' || !peers.has(msg.targetTabId)) return;
         toInject('CREATE_OFFER', { targetTabId: msg.targetTabId });
         sendResponse({ ok: true });
         break;
       case 'SIGNAL':
+        if (!peers.has(msg.fromTabId) || !security.signal(msg.signal)) return;
         toInject('HANDLE_SIGNAL', { fromTabId: msg.fromTabId, signal: msg.signal });
         sendResponse({ ok: true });
         break;
@@ -77,28 +99,26 @@
         break;
       }
       // CLICK_STOP_SHARE 已移除 — 停止共享通过 inject.js 直接停止 stream tracks
-      case 'STOP_SHARING':
+      case 'STOP_SHARING': {
+        const generation = ++commandGeneration;
+        // End captured and cloned tracks immediately, even while a native picker is pending.
+        toInject('STOP_SHARING', {});
+        activeSession = null;
+        currentRole = null;
+        peers.clear();
         log('receive STOP_SHARING command');
         if (!clickNativeStopShareOnce('initial')) {
-          setTimeout(() => clickNativeStopShareOnce('retry'), 700);
+          setTimeout(() => { if (generation === commandGeneration) clickNativeStopShareOnce('retry'); }, 700);
         }
         // 兜底：延迟点击 Messenger 原生停止共享按钮，防止个别组流未结束
         setTimeout(() => {
+          if (generation !== commandGeneration) return;
           log('cleanup streams after native stop grace period');
-          toInject('STOP_SHARING', {});
           nudgeMessengerLayout('stop-sharing-cleanup');
-          return;
-          const stopBtn = null;
-          if (stopBtn) {
-            log('兜底点击 Messenger 停止共享按钮');
-            log('stop share click label:', stopBtn.getAttribute('aria-label') || '(no aria-label)');
-            realClick(stopBtn);
-          }
-          log('cleanup streams after native stop grace period');
-          toInject('STOP_SHARING', {});
         }, 1600);
         sendResponse({ ok: true });
         break;
+      }
       case 'UPDATE_BUTTON':
         updateButton(msg.sharing);
         sendResponse({ ok: true });
@@ -115,7 +135,7 @@
 
   // ---- URL 检测 ----
   function isGroupCall() {
-    return /groupcall/i.test(window.location.href);
+    return security.callUrl(window.location.href);
   }
 
   // ---- 查找共享屏幕按钮 ----
@@ -401,7 +421,7 @@
   }
 
   function toInject(type, data) {
-    window.postMessage({ type: PREFIX + type, data }, '*');
+    window.postMessage({ type: PREFIX + type, direction:'to-page', session:activeSession, data }, location.origin);
   }
 
   // ---- 摄像头检测 ----
@@ -470,7 +490,8 @@
 
     // 共享按钮
     shareBtn = makeIconBtn(shadow, '📺', '#0084ff', '多群共享');
-    shareBtn.addEventListener('click', async () => {
+    shareBtn.addEventListener('click', async (event) => {
+      if (!event.isTrusted) return;
       log('共享按钮被点击, isSharing=', isSharing);
       shareBtn.style.opacity = '0.5';
       shareBtn.style.pointerEvents = 'none';
@@ -502,7 +523,8 @@
 
     // 摄像头按钮
     camBtn = makeIconBtn(shadow, '📷', '#27ae60', '批量开摄像头');
-    camBtn.addEventListener('click', () => {
+    camBtn.addEventListener('click', (event) => {
+      if (!event.isTrusted) return;
       const enable = !isCameraOn();
       if (enable) enableCamera(); else disableCamera();
       try { safeSendBg({ type: 'TOGGLE_ALL_CAMERAS', enable }); } catch (e) {}
@@ -588,5 +610,5 @@
     window.addEventListener('load', createPanel);
   }
 
-  log('已加载, URL:', window.location.href, 'groupcall:', isGroupCall());
+  log('已加载, groupcall:', isGroupCall());
 })();

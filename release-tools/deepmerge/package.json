@@ -1,0 +1,10 @@
+{
+  "name": "@browser-audio/deepmerge-security-backport",
+  "version": "4.3.1-patch.1",
+  "private": true,
+  "main": "index.js",
+  "types": "index.d.ts",
+  "license": "MIT",
+  "description": "Local security backport of deepmerge 4.3.1, GHSA-gcqx-w48m-w2h4; NOT an official upstream release",
+  "dependencies": { "is-mergeable-object": "1.1.0" }
+}

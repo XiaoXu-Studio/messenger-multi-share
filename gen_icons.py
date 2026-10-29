@@ -1,5 +1,6 @@
 """Generate extension icons - fully opaque, no transparency issues."""
 from PIL import Image, ImageDraw
+from pathlib import Path
 
 def draw_icon(size):
     s = size
@@ -77,11 +78,17 @@ def draw_icon(size):
     return img
 
 
-for sz in [16, 48, 128]:
-    icon = draw_icon(sz)
-    path = f'D:/新建文件夹/messenger-multi-share/icons/icon{sz}.png'
-    icon.save(path, format='PNG')
-    # Verify opacity
-    v = Image.open(path)
-    center = v.getpixel((sz // 2, sz // 2))
-    print(f'icon{sz}.png: size={v.size}, center_pixel={center}')
+def main():
+    output = Path(__file__).resolve().parent / 'icons'
+    output.mkdir(exist_ok=True)
+    for sz in [16, 48, 128]:
+        icon = draw_icon(sz)
+        destination = output / f'icon{sz}.png'
+        icon.save(destination, format='PNG')
+        with Image.open(destination) as image:
+            center = image.getpixel((sz // 2, sz // 2))
+            print(f'icon{sz}.png: size={image.size}, center_pixel={center}')
+
+
+if __name__ == '__main__':
+    main()

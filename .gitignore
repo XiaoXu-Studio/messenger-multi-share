@@ -8,3 +8,11 @@ dist/
 __pycache__/
 *.zip
 *.crx
+*.pem
+*.key
+*.pfx
+*.p12
+*.log
+coverage/
+test-results/
+profiles/

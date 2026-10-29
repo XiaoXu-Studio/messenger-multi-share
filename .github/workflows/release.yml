@@ -1,45 +1,78 @@
 name: Release Browser Extension
-
 on:
   push:
-    tags:
-      - 'v*'
-
+    tags: ['v*']
+permissions:
+  contents: read
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 jobs:
-  build:
-    runs-on: ubuntu-latest
+  validation:
+    uses: ./.github/workflows/codeql.yml
+    permissions:
+      contents: read
+      security-events: write
+  publish:
+    if: github.repository == 'XiaoXu-Studio/messenger-multi-share'
+    needs: validation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     permissions:
       id-token: write
       contents: write
       attestations: write
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Prepare extension package
+      - name: Checkout exact commit without persisted credentials
+        shell: bash
         run: |
           set -euo pipefail
-          rm -rf dist
-          mkdir -p dist/icons
-          cp manifest.json background.js content.js inject.js popup.html popup.js README.md dist/
-          cp icons/*.png dist/icons/
-          node -e "JSON.parse(require('fs').readFileSync('dist/manifest.json', 'utf8'))"
-          test -f dist/manifest.json
-
+          [[ "$GITHUB_SHA" =~ ^[a-f0-9]{40}$ ]]
+          [[ "$GITHUB_REPOSITORY" == XiaoXu-Studio/messenger-multi-share ]]
+          [[ "$GITHUB_SERVER_URL" == https://github.com ]]
+          [[ ! -e .git && -z "$(ls -A .)" ]]
+          git init --initial-branch=bootstrap .
+          git remote add origin "https://github.com/$GITHUB_REPOSITORY.git"
+          GIT_TERMINAL_PROMPT=0 git -c credential.helper= -c core.hooksPath=/dev/null fetch --no-tags --depth=1 origin "$GITHUB_SHA"
+          git -c core.hooksPath=/dev/null checkout --detach "$GITHUB_SHA"
+          [[ "$(git rev-parse HEAD)" == "$GITHUB_SHA" ]]
+      - name: Install verified Node.js
+        run: sh scripts/setup-node.sh
+      - name: Validate release tag
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+      - name: Rebuild verified source and release tools
+        run: |
+          set -euo pipefail
+          npm ci --ignore-scripts --no-audit --no-fund
+          npm test
+          npm run build
+          (cd release-tools/attest && npm ci --ignore-scripts --no-audit --no-fund)
+          (cd release-tools/release && npm ci --ignore-scripts --no-audit --no-fund)
+          npm audit --prefix release-tools/attest --audit-level=low
+          npm audit --prefix release-tools/release --audit-level=low
+          npm run package --prefix release-tools/attest
+          npm run build --prefix release-tools/release
+          node release-tools/verify.cjs
       - name: Package extension
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           cd dist
-          zip -r ../messenger-multi-share-${{ github.ref_name }}.zip .
-
-      - name: Attest Build Provenance
-        uses: actions/attest-build-provenance@v2
+          zip -r "../messenger-multi-share-${RELEASE_TAG}.zip" .
+      - name: Verify every archive entry
+        run: npm run verify:zip
+      - name: Attest build provenance
+        uses: ./release-tools/attest
         with:
-          subject-path: '*.zip'
-
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
+          subject-path: 'messenger-multi-share-v*.zip'
+      - name: Publish release
+        uses: ./release-tools/release
         with:
-          files: '*.zip'
+          files: 'messenger-multi-share-v*.zip'
+          fail_on_unmatched_files: true
           generate_release_notes: true

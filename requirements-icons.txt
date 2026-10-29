@@ -1,0 +1,2 @@
+# Optional developer tool only; not installed by the extension or release workflow.
+Pillow==13.0.0

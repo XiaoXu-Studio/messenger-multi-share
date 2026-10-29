@@ -4,3 +4,15 @@ updates:
     directory: /
     schedule:
       interval: weekly
+  - package-ecosystem: npm
+    directory: /release-tools/attest
+    schedule:
+      interval: weekly
+  - package-ecosystem: npm
+    directory: /release-tools/release
+    schedule:
+      interval: weekly
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly

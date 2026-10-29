@@ -1,0 +1,6 @@
+* text=auto
+*.sh text eol=lf
+*.yml text eol=lf
+*.png binary
+release-tools/release/__tests__/release.txt -text
+release-tools/release/tests/data/foo/bar.txt -text

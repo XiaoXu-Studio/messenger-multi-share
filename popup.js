@@ -35,7 +35,8 @@
     });
     await refreshTabs();
 
-    chrome.runtime.onMessage.addListener((msg) => {
+    chrome.runtime.onMessage.addListener((msg, sender) => {
+      if (sender.id !== chrome.runtime.id || sender.tab || !msg) return;
       if (msg.type === 'STATE_UPDATE') {
         sharing = msg.state.sharing;
         sharingCount = 1 + (msg.state.receiverTabs?.length || 0);
@@ -131,8 +132,13 @@
     btnStart.disabled = true;
     btnStart.textContent = '⏳ 启动中...';
     sharingCount = ids.length;
-    chrome.runtime.sendMessage({ type: 'START_SHARING', tabIds: ids }, () => {
-      sharing = true;
+    chrome.runtime.sendMessage({ type: 'START_SHARING', tabIds: ids }, (result) => {
+      sharing = !chrome.runtime.lastError && result?.ok === true;
+      if (!sharing) {
+        btnStart.disabled = false;
+        btnStart.textContent = '▶ 重试共享';
+        hint.textContent = result?.error || '共享未启动，请刷新列表后重试';
+      }
       showView();
     });
   });
@@ -154,7 +160,6 @@
     btnCamOn.disabled = true;
     btnCamOn.textContent = '⏳ 开启中...';
     // 获取当前活动标签页来触发批量操作
-    const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
     await chrome.runtime.sendMessage({
       type: 'TOGGLE_ALL_CAMERAS_FROM_POPUP',
       enable: true,
@@ -233,7 +238,7 @@
           : tab.injected
             ? '<span class="diag-ok">脚本正常</span>'
             : '<span class="diag-warn">未响应</span>';
-      return `<div class="diag-line"><span>#${tab.tabId} ${escapeHtml(tab.role || '')}</span><span>${state}</span></div>`;
+      return `<div class="diag-line"><span>#${escapeHtml(tab.tabId)} ${escapeHtml(tab.role || '')}</span><span>${state}</span></div>`;
     });
 
     diagPanel.innerHTML = [

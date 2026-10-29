@@ -1,0 +1,8 @@
+{
+  "name": "@browser-audio/http-cache-semantics-security-backport",
+  "version": "4.3.0-patch.1",
+  "private": true,
+  "main": "index.js",
+  "license": "BSD-2-Clause",
+  "description": "Local defensive backport for disputed GHSA-ch52-4w7c-c8xp; based on upstream 4.3.0, NOT an official release"
+}
