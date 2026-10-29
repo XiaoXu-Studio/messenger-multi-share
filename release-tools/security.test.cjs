@@ -55,6 +55,14 @@ test('ordinary public cached responses still work', () => {
   assert.ok(policy.evaluateRequest(request).response);
 });
 
+test('Connection header separators handle adversarial whitespace in linear steps', () => {
+  const policy = new CachePolicy({url: 'https://fixture.invalid/', headers:{}}, {status:200, headers:{}});
+  const headers = policy._copyWithoutHopByHopHeaders({connection: ' keep-alive , x-remove ', 'x-remove':'secret', 'x-keep':'ok'});
+  assert.equal(headers['x-remove'], undefined);
+  assert.equal(headers['x-keep'], 'ok');
+  assert.doesNotThrow(() => policy._copyWithoutHopByHopHeaders({connection:'x' + ' '.repeat(200000) + 'y'}));
+});
+
 test('real Sigstore DSSE signing survives core upgrade and binds payload type', async () => {
   const { DSSEBundleBuilder } = fromAttest('@sigstore/sign');
   const { dsse } = fromAttest('@sigstore/core');

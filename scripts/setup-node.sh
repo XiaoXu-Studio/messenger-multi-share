@@ -15,3 +15,4 @@ tar -xJf "$directory/$archive" -C "$directory" --no-same-owner
 binary="$directory/node-v$version-linux-x64/bin"
 [ "$("$binary/node" --version)" = "v$version" ] || exit 1
 printf '%s\n' "$binary" >> "$GITHUB_PATH"
+PATH="$binary:$PATH" "$binary/node" scripts/setup-npm.cjs "$directory"

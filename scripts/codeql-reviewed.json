@@ -1,0 +1,17 @@
+[
+  {
+    "file": "scripts/audit-upstream.cjs",
+    "sha256": "ff109e35df3d95b1bdc23dac5ec11fa149bec4e08681d75761772cc45a928e39",
+    "sinks": [
+      "await fs.writeFile(path.join(dir,name),body);if(name==='package.json')pkg=parsed;else lock=parsed;}",
+      "await fs.writeFile(path.join(evidence,'inventory.json'),JSON.stringify(results,null,2));"
+    ],
+    "reason": "Reviewed informational: deliberately records untrusted upstream JSON as audit evidence, not executable code. Output paths come exclusively from fixed repository/file lists and the operator-selected evidence root, never HTTP data. The downloaded package scripts are never installed or executed. Reported versions/metadata remain untrusted evidence. Not shipped in the extension or invoked during publication."
+  },
+  {
+    "file": "scripts/audit-dependencies.cjs",
+    "sha256": "d21cc6f101c1921f9319043da4830d2217171bb86a0d6fb351a380f2aaad06c8",
+    "sinks": ["fs.writeFileSync(path.join(repo, 'test-results/final-dependency-scan.json'), JSON.stringify(results, null, 2) + '\\n');"],
+    "reason": "Reviewed informational: writes advisory API results as non-executable JSON to a constant test-results filename. HTTP values cannot choose the path and are never evaluated. The scan fails closed on advisory matches/errors. The JSON is excluded from extension packaging."
+  }
+]

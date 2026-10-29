@@ -40,6 +40,7 @@ jobs:
           (cd release-tools/release && npm ci --ignore-scripts --no-audit --no-fund)
           npm audit --prefix release-tools/attest --audit-level=low
           npm audit --prefix release-tools/release --audit-level=low
+          node scripts/audit-dependencies.cjs
           node --test release-tools/security.test.cjs
           (cd release-tools/attest && npm run lint && node node_modules/typescript/bin/tsc --noEmit && node --experimental-vm-modules node_modules/jest/bin/jest.js --runInBand)
           (cd release-tools/release && npm run typecheck && npm test -- --run)

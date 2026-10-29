@@ -7,6 +7,7 @@ import fs from 'fs/promises'
 import path from 'path'
 
 import { readArtifactsList } from './artifacts'
+import { readBounded } from './read-bounded'
 
 import type { Subject } from '@actions/attest'
 
@@ -205,30 +206,22 @@ const getSubjectFromChecksums = async (
   subjectChecksums: string
 ): Promise<Subject[]> => {
   try {
-    await fs.access(subjectChecksums)
-    return getSubjectFromChecksumsFile(subjectChecksums)
-  } catch {
-    return getSubjectFromChecksumsString(subjectChecksums)
-  }
-}
-
-const getSubjectFromChecksumsFile = async (
-  checksumsPath: string
-): Promise<Subject[]> => {
-  const stats = await fs.stat(checksumsPath)
-  if (!stats.isFile()) {
-    throw new Error(`subject checksums file not found: ${checksumsPath}`)
-  }
-
-  /* istanbul ignore next */
-  if (stats.size > MAX_SUBJECT_CHECKSUM_SIZE_BYTES) {
-    throw new Error(
-      `subject checksums file exceeds maximum allowed size: ${MAX_SUBJECT_CHECKSUM_SIZE_BYTES} bytes`
+    const checksums = await readBounded(
+      subjectChecksums,
+      MAX_SUBJECT_CHECKSUM_SIZE_BYTES,
+      'subject checksums'
     )
+    return getSubjectFromChecksumsString(checksums)
+  } catch (error) {
+    if (
+      ['ENOENT', 'ENAMETOOLONG', 'EINVAL'].includes(
+        (error as NodeJS.ErrnoException).code || ''
+      )
+    ) {
+      return getSubjectFromChecksumsString(subjectChecksums)
+    }
+    throw error
   }
-
-  const checksums = await fs.readFile(checksumsPath, 'utf-8')
-  return getSubjectFromChecksumsString(checksums)
 }
 
 const getSubjectFromChecksumsString = (checksums: string): Subject[] => {

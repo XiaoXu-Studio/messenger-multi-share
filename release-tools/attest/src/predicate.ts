@@ -1,4 +1,4 @@
-import fs from 'fs/promises'
+import { readBounded } from './read-bounded'
 
 import type { Predicate } from '@actions/attest'
 
@@ -33,21 +33,19 @@ export const predicateFromInputs = async (
 
   if (predicatePath) {
     try {
-      await fs.access(predicatePath)
-    } catch {
-      throw new Error(`predicate file not found: ${predicatePath}`)
-    }
-
-    const stat = await fs.stat(predicatePath)
-
-    /* istanbul ignore next */
-    if (stat.size > MAX_PREDICATE_SIZE_BYTES) {
-      throw new Error(
-        `predicate file exceeds maximum allowed size: ${MAX_PREDICATE_SIZE_BYTES} bytes`
+      params = await readBounded(
+        predicatePath,
+        MAX_PREDICATE_SIZE_BYTES,
+        'predicate'
       )
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        throw new Error(`predicate file not found: ${predicatePath}`, {
+          cause: error
+        })
+      }
+      throw error
     }
-
-    params = await fs.readFile(predicatePath, 'utf-8')
   } else {
     if (predicate.length > MAX_PREDICATE_SIZE_BYTES) {
       throw new Error(

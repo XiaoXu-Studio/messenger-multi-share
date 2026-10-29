@@ -24,7 +24,7 @@ describe('parseSBOMFromPath', () => {
 
     it('should rethrow non-ENOENT errors', async () => {
       const statSpy = jest
-        .spyOn(fs, 'stat')
+        .spyOn(fs, 'open')
         .mockRejectedValueOnce(
           Object.assign(new Error('Permission denied'), { code: 'EACCES' })
         )

@@ -1,4 +1,4 @@
-import fs from 'fs/promises'
+import { readBounded } from './read-bounded'
 
 import type { Predicate } from '@actions/attest'
 
@@ -11,9 +11,9 @@ export type SBOM = {
 const MAX_SBOM_SIZE_BYTES = 16 * 1024 * 1024
 
 export const parseSBOMFromPath = async (filePath: string): Promise<SBOM> => {
-  let stats
+  let fileContent: string
   try {
-    stats = await fs.stat(filePath)
+    fileContent = await readBounded(filePath, MAX_SBOM_SIZE_BYTES, 'SBOM')
   } catch (error) {
     const err = error as NodeJS.ErrnoException
     if (err.code === 'ENOENT') {
@@ -22,13 +22,6 @@ export const parseSBOMFromPath = async (filePath: string): Promise<SBOM> => {
     throw error
   }
 
-  if (stats.size > MAX_SBOM_SIZE_BYTES) {
-    throw new Error(
-      `SBOM file exceeds maximum allowed size: ${MAX_SBOM_SIZE_BYTES} bytes`
-    )
-  }
-
-  const fileContent = await fs.readFile(filePath, 'utf8')
   const sbom = JSON.parse(fileContent) as object
 
   if (checkIsSPDX(sbom)) {

@@ -21,6 +21,20 @@ for (const tool of ['', 'release-tools/attest', 'release-tools/release']) {
   }
 }
 (async () => {
+  if (process.env.MMS_NPM_ROOT) {
+    const root = path.resolve(process.env.MMS_NPM_ROOT);
+    function inventory(dir) {
+      for (const item of fs.readdirSync(dir, {withFileTypes:true})) {
+        if (!item.isDirectory()) continue;
+        const entry = path.join(dir, item.name);
+        if (item.name.startsWith('@')) { inventory(entry); continue; }
+        const pkg = JSON.parse(fs.readFileSync(path.join(entry, 'package.json'), 'utf8'));
+        unique.set(pkg.name + '@' + pkg.version, {package:{ecosystem:'npm',name:pkg.name},version:pkg.version});
+        if (fs.existsSync(path.join(entry, 'node_modules'))) inventory(path.join(entry, 'node_modules'));
+      }
+    }
+    inventory(path.join(root, 'node_modules'));
+  }
   const queries = [...unique.values(), {package:{ecosystem:'PyPI',name:'Pillow'},version:'13.0.0'}];
   for (let i = 0; i < queries.length; i += 100) {
     const batch = queries.slice(i, i + 100);
@@ -37,4 +51,5 @@ for (const tool of ['', 'release-tools/attest', 'release-tools/release']) {
   fs.writeFileSync(path.join(repo, 'test-results/final-dependency-scan.json'), JSON.stringify(results, null, 2) + '\n');
   console.log(JSON.stringify({audits: results.audits.map(r=>({tool:r.tool, vulnerabilities:r.audit.metadata.vulnerabilities})),
     osvQueries: results.osv.length, osvMatches: results.osv.filter(r=>r.vulns?.length)}));
+  if (results.osv.some(r=>r.vulns?.length)) throw new Error('Unresolved OSV matches; publication is blocked');
 })().catch(error => {console.error(error.message); process.exitCode=1;});
